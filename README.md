@@ -18,9 +18,29 @@ Find the binaries in the release page, choose one per your working platform, the
 
 ### Build From Source
 Clone the repository and build it by cargo
-```
+```bash
 cargo build --release
 cargo run
+```
+
+### Using Nix
+If you have Nix installed, you can run the project without cloning:
+
+#### Run locally (after cloning)
+```bash
+nix run .
+```
+
+#### Run remotely from GitHub
+```bash
+nix run "git+https://github.com/pansila/mcp_server_gdb.git" -- --help
+
+```
+
+#### Development environment
+To enter a development shell with all dependencies:
+```bash
+nix develop
 ```
 
 ## Usage
