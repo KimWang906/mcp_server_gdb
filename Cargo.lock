@@ -1292,6 +1292,7 @@ dependencies = [
  "crossterm",
  "dotenv",
  "futures",
+ "mcp-server-gdb-macros",
  "nix 0.31.1",
  "nom 8.0.0",
  "openssl",
@@ -1308,6 +1309,15 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "mcp-server-gdb-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.100",
 ]
 
 [[package]]

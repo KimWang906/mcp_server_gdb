@@ -3,9 +3,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 use rmcp::handler::server::tool::ToolRouter;
+use rmcp::handler::server::router::tool::CallToolHandlerExt;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo, ToolsCapability};
-use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ErrorData, ServerHandler, tool, tool_handler};
+use mcp_server_gdb_macros::tool_router_with_gef;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -165,7 +167,7 @@ macro_rules! gef_function_tool {
 }
 
 #[allow(dead_code)]
-#[tool_router]
+#[tool_router_with_gef]
 impl GdbService {
     #[tool(
         name = "create_session",
