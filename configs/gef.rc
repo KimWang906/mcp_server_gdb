@@ -1,0 +1,5 @@
+[gef]
+disable_color = True
+
+[context]
+enable = False
