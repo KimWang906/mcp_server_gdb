@@ -48,7 +48,7 @@ nix develop
 1. 직접 실행: `./mcp-server-gdb`
 2. 두 가지 전송 모드를 지원합니다:
    - Stdio (기본): 표준 입출력 기반
-   - SSE: Server-Sent Events 기반, 기본 주소 `http://127.0.0.1:8080`
+   - SSE: Server-Sent Events 기반, 기본 주소 `http://127.0.0.1:7774`
 
 ### CLI 옵션
 

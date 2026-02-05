@@ -50,7 +50,7 @@ nix develop
 1. Just run it directly: `./mcp-server-gdb`
 2. The server supports two transport modes:
    - Stdio (default): Standard input/output transport
-   - SSE: Server-Sent Events transport, default at `http://127.0.0.1:8080`
+   - SSE: Server-Sent Events transport, default at `http://127.0.0.1:7774`
 
 ### CLI Options
 

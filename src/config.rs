@@ -14,7 +14,7 @@ impl Default for Config {
         Self {
             server_ip: std::env::var("SERVER_IP").unwrap_or_else(|_| "127.0.0.1".to_string()),
             server_port: std::env::var("SERVER_PORT")
-                .unwrap_or_else(|_| "8080".to_string())
+                .unwrap_or_else(|_| "7774".to_string())
                 .parse()
                 .expect("Invalid server port"),
             command_timeout: std::env::var("GDB_COMMAND_TIMEOUT")
