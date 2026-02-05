@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation};
 
 use super::{BLUE, DARK_GRAY, GREEN, ORANGE, SCROLL_CONTROL_TEXT, YELLOW};
-use crate::models::{RegisterRaw, TrackedRegister};
+use mcp_server_gdb::models::{RegisterRaw, TrackedRegister};
 use crate::{App, Endian};
 
 pub const HEXDUMP_WIDTH: usize = 16;
@@ -80,6 +80,7 @@ fn to_hexdump_str<'a>(
     lines
 }
 
+#[allow(dead_code)]
 fn deref_bytes_to_registers(
     endian: &Option<Endian>,
     chunk: &[u8],
@@ -91,10 +92,11 @@ fn deref_bytes_to_registers(
     for w in chunk.windows(windows) {
         let bytes_val = if thirty {
             let val = if endian.unwrap() == Endian::Big {
-                // TODO: try_into()
-                u32::from_be_bytes([w[0], w[1], w[2], w[3]])
+                let bytes: [u8; 4] = w.try_into().expect("window size");
+                u32::from_be_bytes(bytes)
             } else {
-                u32::from_le_bytes([w[0], w[1], w[2], w[3]])
+                let bytes: [u8; 4] = w.try_into().expect("window size");
+                u32::from_le_bytes(bytes)
             };
 
             val as u64
@@ -141,6 +143,7 @@ fn color(byte: u8) -> Color {
     }
 }
 
+#[allow(dead_code)]
 fn popup_area(area: Rect, percent_x: u16) -> Rect {
     let vertical = Layout::vertical([Constraint::Length(3)]).flex(Flex::Center);
     let horizontal = Layout::horizontal([Constraint::Percentage(percent_x)]).flex(Flex::Center);
@@ -149,7 +152,7 @@ fn popup_area(area: Rect, percent_x: u16) -> Rect {
     area
 }
 
-fn block(pos: &str) -> Block {
+fn block(pos: &str) -> Block<'_> {
     let block = Block::default().borders(Borders::ALL).title(
         format!("Hexdump{pos} {SCROLL_CONTROL_TEXT}, Save(S), HEAP(H), STACK(T))").fg(ORANGE),
     );

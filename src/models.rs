@@ -179,7 +179,7 @@ impl BreakPointSet {
     pub fn remove_breakpoint(&mut self, bp_num: BreakPointNumber) {
         self.map.remove(&bp_num);
         if bp_num.minor.is_none() {
-            //TODO: ensure removal of child breakpoints
+            self.map.retain(|k, _| k.major != bp_num.major || k.minor.is_none());
         }
         self.notify_change();
     }
@@ -236,7 +236,10 @@ impl FromStr for PrintValue {
             0 => Ok(PrintValue::NoValues),
             1 => Ok(PrintValue::AllValues),
             2 => Ok(PrintValue::SimpleValues),
-            _ => Err(AppError::InvalidArgument("only 0,1,2 are valid".to_string())),
+            _ => Err(AppError::invalid_argument(
+                "models.memory_type",
+                "only 0,1,2 are valid",
+            )),
         }
     }
 }

@@ -9,10 +9,10 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::{ORANGE, PURPLE, RED, add_resolve_symbol_to_span, apply_val_color};
 use crate::App;
-use crate::models::{RegisterRaw, TrackedRegister};
+use mcp_server_gdb::models::{RegisterRaw, TrackedRegister};
 
 /// Registers
-pub fn draw_registers<'a>(app: &App, f: &mut Frame<'a>, register: Rect) {
+pub fn draw_registers<'a>(app: &mut App, f: &mut Frame<'a>, register: Rect) {
     let block = Block::default().borders(Borders::TOP).title("Registers".fg(ORANGE));
 
     let mut lines = vec![];
@@ -25,15 +25,19 @@ pub fn draw_registers<'a>(app: &App, f: &mut Frame<'a>, register: Rect) {
         return;
     }
 
-    // find longest register name
-    // TODO: cache this
     let reg_changed = app.register_changed.clone();
-    for TrackedRegister { register, resolve: _ } in regs.iter() {
-        if let Some(reg) = register {
-            if let (Some(name), Some(_)) = (&reg.name, &reg.value) {
-                longest_register_name = name.len();
+    if app.register_name_width_cache_len != regs.len() || app.register_name_width_cache == 0 {
+        for TrackedRegister { register, resolve: _ } in regs.iter() {
+            if let Some(reg) = register {
+                if let (Some(name), Some(_)) = (&reg.name, &reg.value) {
+                    longest_register_name = longest_register_name.max(name.len());
+                }
             }
         }
+        app.register_name_width_cache = longest_register_name;
+        app.register_name_width_cache_len = regs.len();
+    } else {
+        longest_register_name = app.register_name_width_cache;
     }
     let width: usize = if app.bit32 { 11 } else { 19 };
 

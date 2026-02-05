@@ -1,29 +1,28 @@
-mod config;
-mod error;
-mod gdb;
-mod mi;
-mod models;
-mod tools;
 mod ui;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
+use axum::Router;
+use axum::routing::any_service;
 use clap::{Parser, ValueEnum};
 use crossterm::event::EventStream;
-use error::{AppError, AppResult};
 use futures::StreamExt;
-use gdb::GDBManager;
-use mcp_core::server::{Server, ServerProtocolBuilder};
-use mcp_core::transport::{ServerSseTransport, ServerStdioTransport, Transport};
-use mcp_core::types::ServerCapabilities;
-use models::{ASM, BT, MemoryMapping, MemoryType, ResolveSymbol, TrackedRegister};
+use mcp_server_gdb::GDBManager;
+use mcp_server_gdb::config::Config;
+use mcp_server_gdb::error::{AppError, AppResult};
+use mcp_server_gdb::models::{
+    ASM, BT, Memory, MemoryMapping, MemoryType, ResolveSymbol, TrackedRegister,
+};
+use mcp_server_gdb::tools::{self, GDB_MANAGER};
 use ratatui::Terminal;
+use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::event::{DisableMouseCapture, Event, KeyCode};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -31,9 +30,10 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::prelude::Backend;
 use ratatui::widgets::ScrollbarState;
-use serde_json::json;
+use rmcp::ServiceExt;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService, stdio};
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tools::GDB_MANAGER;
 use tracing::{debug, error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::EnvFilter;
@@ -59,9 +59,7 @@ impl FromStr for TransportType {
     }
 }
 
-pub static TRANSPORT: LazyLock<Mutex<Option<Arc<Box<dyn Transport>>>>> =
-    LazyLock::new(|| Mutex::new(None));
-
+#[allow(dead_code)]
 fn resolve_home(path: &str) -> Option<PathBuf> {
     if path.starts_with("~/") {
         if let Ok(home) = env::var("HOME") {
@@ -144,6 +142,7 @@ pub struct MyScrollState {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 struct App {
     gdb: GDBManager,
     /// -32 bit mode
@@ -158,7 +157,7 @@ struct App {
     memory_map: Option<Vec<MemoryMapping>>,
     memory_map_scroll: MyScrollState,
     /// Current $pc
-    current_pc: u64, // TODO: replace with AtomicU64?
+    current_pc: AtomicU64,
     /// All output from gdb
     output: Vec<String>,
     output_scroll: MyScrollState,
@@ -167,10 +166,13 @@ struct App {
     /// Register TUI
     register_changed: Vec<u8>,
     registers: Vec<TrackedRegister>,
+    register_name_width_cache: usize,
+    register_name_width_cache_len: usize,
     /// Saved Stack
     stack: BTreeMap<u64, ResolveSymbol>,
     /// Saved ASM
     asm: Vec<ASM>,
+    asm_cache: AsmCache,
     /// Hexdump
     hexdump: Option<(u64, Vec<u8>)>,
     hexdump_scroll: MyScrollState,
@@ -183,8 +185,18 @@ struct App {
     _exit: bool,
 }
 
+#[derive(Default)]
+struct AsmCache {
+    pc: u64,
+    len: usize,
+    pc_index: Option<usize>,
+    function_name: Option<String>,
+    tallest_function_len: usize,
+}
+
 impl App {
     // Parse a "file filepath" command and save
+    #[allow(dead_code)]
     fn save_filepath(&mut self, val: &str) {
         let filepath: Vec<&str> = val.split_whitespace().collect();
         let filepath = resolve_home(filepath[1]).expect("Failed to resolve home directory");
@@ -205,6 +217,14 @@ impl App {
             // look through, add see if the value is part of the stack
             // trace!("{:02x?}", memory_map);
             if let Some(memory_map) = self.memory_map.as_ref() {
+                let mut exec_paths: HashSet<&Path> = HashSet::new();
+                for r in memory_map {
+                    if r.is_exec() {
+                        if let Some(path) = r.path.as_ref() {
+                            exec_paths.insert(path.as_path());
+                        }
+                    }
+                }
                 for r in memory_map {
                     if r.contains(val) {
                         if r.is_stack() {
@@ -213,9 +233,10 @@ impl App {
                         if r.is_heap() {
                             return MemoryType::Heap;
                         }
-                        if r.is_path(filepath) || r.is_exec() {
-                            // TODO(23): This could be expanded to all segments loaded in
-                            // as executable
+                        if r.is_path(filepath)
+                            || r.is_exec()
+                            || r.path.as_ref().map_or(false, |p| exec_paths.contains(p.as_path()))
+                        {
                             return MemoryType::Exec;
                         }
                     }
@@ -245,7 +266,7 @@ async fn main() -> Result<(), AppError> {
         .init();
 
     // Get configuration
-    let config = config::Config::default();
+    let config = Config::default();
     debug!("config: {:?}", config);
 
     info!("Starting MCP GDB Server on port {}", config.server_port);
@@ -254,7 +275,15 @@ async fn main() -> Result<(), AppError> {
 
     // Initialize terminal
     let ui_handle = if args.enable_tui {
-        // TODO: add panic hook to restore terminal
+        let default_hook = std::panic::take_hook();
+        let restored = Arc::new(AtomicBool::new(false));
+        let restored_hook = restored.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            if !restored_hook.swap(true, Ordering::SeqCst) {
+                let _ = restore_terminal_stdout();
+            }
+            default_hook(info);
+        }));
         enable_raw_mode()?;
         execute!(std::io::stdout(), EnterAlternateScreen)?;
         match ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())) {
@@ -284,78 +313,82 @@ async fn main() -> Result<(), AppError> {
 
     tools::init_gdb_manager();
 
-    let server_protocol =
-        Server::builder("MCP Server GDB".to_string(), env!("CARGO_PKG_VERSION").to_string())
-            .capabilities(ServerCapabilities {
-                tools: Some(json!({
-                    "listChanged": false,
-                })),
-                ..Default::default()
-            });
-
-    let server_protocol = register_tools(server_protocol).build();
-
-    let transport = match args.transport {
+    match args.transport {
         TransportType::Stdio => {
-            let transport = Arc::new(
-                Box::new(ServerStdioTransport::new(server_protocol)) as Box<dyn Transport>
-            );
-            {
-                let mut transport_guard = TRANSPORT.lock().await;
-                *transport_guard = Some(transport.clone());
+            let service = tools::GdbService::new();
+            let mut running = service.serve(stdio()).await?;
+
+            if let Some((terminal, tui_handle, quit_receiver)) = ui_handle {
+                if let Err(e) = quit_receiver.await {
+                    error!("failed to receive quit signal: {}", e);
+                }
+
+                tui_handle.abort();
+
+                // Restore terminal if it was initialized
+                disable_raw_mode()?;
+                let mut terminal = terminal.lock().await;
+                execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+                terminal.show_cursor()?;
+                debug!("TUI closed");
+
+                if let Err(e) = running.close().await {
+                    error!("failed to close stdio service: {}", e);
+                }
+            } else {
+                debug!("waiting for stdio service to complete");
+                if let Err(e) = running.waiting().await {
+                    error!("stdio service task error: {}", e);
+                }
+                return Ok(());
             }
-            transport
         }
         TransportType::Sse => {
-            let transport = Arc::new(Box::new(ServerSseTransport::new(
-                config.server_ip,
-                config.server_port,
-                server_protocol,
-            )) as Box<dyn Transport>);
-            {
-                let mut transport_guard = TRANSPORT.lock().await;
-                *transport_guard = Some(transport.clone());
+            let addr = format!("{}:{}", config.server_ip, config.server_port);
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            let session_manager = Arc::new(LocalSessionManager::default());
+            let http_service = StreamableHttpService::new(
+                || Ok(tools::GdbService::new()),
+                session_manager,
+                StreamableHttpServerConfig::default(),
+            );
+            let app = Router::new().route("/mcp", any_service(http_service));
+
+            if let Some((terminal, tui_handle, quit_receiver)) = ui_handle {
+                let (shutdown_tx, shutdown_rx) = oneshot::channel();
+                let server_handle = tokio::spawn(async move {
+                    let server = axum::serve(listener, app).with_graceful_shutdown(async {
+                        let _ = shutdown_rx.await;
+                    });
+                    if let Err(e) = server.await {
+                        error!("streamable HTTP server error: {}", e);
+                    }
+                });
+
+                if let Err(e) = quit_receiver.await {
+                    error!("failed to receive quit signal: {}", e);
+                }
+
+                tui_handle.abort();
+
+                // Restore terminal if it was initialized
+                disable_raw_mode()?;
+                let mut terminal = terminal.lock().await;
+                execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+                terminal.show_cursor()?;
+                debug!("TUI closed");
+
+                let _ = shutdown_tx.send(());
+                if let Err(e) = server_handle.await {
+                    error!("streamable HTTP server task error: {}", e);
+                }
+            } else {
+                debug!("waiting for streamable HTTP server to complete");
+                axum::serve(listener, app).await?;
+                return Ok(());
             }
-            transport
         }
-    };
-
-    // Start transport in a separate task
-    let transport_clone = transport.clone();
-    let transport_handle = tokio::spawn(async move {
-        if let Err(e) = transport_clone.open().await {
-            error!("transport error: {}", e);
-        }
-    });
-
-    // Wait for quit signal if TUI is running
-    if let Some((terminal, tui_handle, quit_receiver)) = ui_handle {
-        if let Err(e) = quit_receiver.await {
-            error!("failed to receive quit signal: {}", e);
-        }
-
-        tui_handle.abort();
-
-        // Restore terminal if it was initialized
-        disable_raw_mode()?;
-        let mut terminal = terminal.lock().await;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
-        terminal.show_cursor()?;
-        debug!("TUI closed");
-    } else {
-        // If no TUI, wait for transport to complete
-        debug!("waiting for transport to complete");
-        if let Err(e) = transport_handle.await {
-            error!("transport task error: {}", e);
-        }
-        return Ok(());
     }
-
-    // Close transport
-    if let Err(e) = transport.close().await {
-        error!("failed to close transport: {}", e);
-    }
-    transport_handle.abort();
 
     // Close all GDB sessions
     let sessions = tools::GDB_MANAGER.get_all_sessions().await?;
@@ -364,9 +397,6 @@ async fn main() -> Result<(), AppError> {
             error!("failed to close session {}: {}", session.id, e);
         }
     }
-
-    // TODO: transport is still running due to a sync call (reader.read_line) in the
-    // dependency
     std::process::exit(0);
 }
 
@@ -384,6 +414,50 @@ fn scroll_up(n: usize, scroll: &mut MyScrollState) {
         scroll.scroll = 0;
     }
     scroll.state = scroll.state.position(scroll.scroll);
+}
+
+fn restore_terminal_stdout() -> std::io::Result<()> {
+    disable_raw_mode()?;
+    execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture, Show)?;
+    Ok(())
+}
+
+fn parse_hex_u64(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    let trimmed = value.strip_prefix("0x").unwrap_or(value);
+    u64::from_str_radix(trimmed, 16).map_err(|_| format!("invalid hex address: {}", value))
+}
+
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
+    let bytes = hex.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return Err("odd-length hex string".to_string());
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_value(bytes[i])?;
+        let lo = hex_value(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn hex_value(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(format!("invalid hex digit: {}", byte as char)),
+    }
+}
+
+fn decode_memory(memory: &[Memory]) -> Result<(u64, Vec<u8>), String> {
+    let first = memory.first().ok_or_else(|| "empty memory result".to_string())?;
+    let address = parse_hex_u64(&first.begin)?;
+    let bytes = hex_to_bytes(&first.contents)?;
+    Ok((address, bytes))
 }
 
 async fn run_app<B: Backend + Send + 'static>(
@@ -503,7 +577,14 @@ async fn run_app<B: Backend + Send + 'static>(
                                     find_heap.size as usize,
                                 )
                                 .await?;
-                            // TODO: print memory
+                            match decode_memory(&memory) {
+                                Ok((address, bytes)) => {
+                                    app.hexdump = Some((address, bytes));
+                                }
+                                Err(err) => {
+                                    app.status = format!("hexdump: {}", err);
+                                }
+                            }
 
                             // reset position
                             app.hexdump_scroll.scroll = 0;
@@ -520,7 +601,14 @@ async fn run_app<B: Backend + Send + 'static>(
                                     find_stack.size as usize,
                                 )
                                 .await?;
-                            // TODO: print memory
+                            match decode_memory(&memory) {
+                                Ok((address, bytes)) => {
+                                    app.hexdump = Some((address, bytes));
+                                }
+                                Err(err) => {
+                                    app.status = format!("hexdump: {}", err);
+                                }
+                            }
 
                             // reset position
                             app.hexdump_scroll.scroll = 0;
@@ -600,26 +688,4 @@ async fn run_app<B: Backend + Send + 'static>(
     }
 
     Ok(())
-}
-
-/// Register all debugging tools to the server
-fn register_tools(builder: ServerProtocolBuilder) -> ServerProtocolBuilder {
-    builder
-        .register_tool(tools::CreateSessionTool::tool(), tools::CreateSessionTool::call())
-        .register_tool(tools::GetSessionTool::tool(), tools::GetSessionTool::call())
-        .register_tool(tools::GetAllSessionsTool::tool(), tools::GetAllSessionsTool::call())
-        .register_tool(tools::CloseSessionTool::tool(), tools::CloseSessionTool::call())
-        .register_tool(tools::StartDebuggingTool::tool(), tools::StartDebuggingTool::call())
-        .register_tool(tools::StopDebuggingTool::tool(), tools::StopDebuggingTool::call())
-        .register_tool(tools::GetBreakpointsTool::tool(), tools::GetBreakpointsTool::call())
-        .register_tool(tools::SetBreakpointTool::tool(), tools::SetBreakpointTool::call())
-        .register_tool(tools::DeleteBreakpointTool::tool(), tools::DeleteBreakpointTool::call())
-        .register_tool(tools::GetStackFramesTool::tool(), tools::GetStackFramesTool::call())
-        .register_tool(tools::GetLocalVariablesTool::tool(), tools::GetLocalVariablesTool::call())
-        .register_tool(tools::ContinueExecutionTool::tool(), tools::ContinueExecutionTool::call())
-        .register_tool(tools::StepExecutionTool::tool(), tools::StepExecutionTool::call())
-        .register_tool(tools::NextExecutionTool::tool(), tools::NextExecutionTool::call())
-        .register_tool(tools::GetRegistersTool::tool(), tools::GetRegistersTool::call())
-        .register_tool(tools::GetRegisterNamesTool::tool(), tools::GetRegisterNamesTool::call())
-        .register_tool(tools::ReadMemoryTool::tool(), tools::ReadMemoryTool::call())
 }

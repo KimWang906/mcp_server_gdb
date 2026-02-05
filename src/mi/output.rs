@@ -74,7 +74,14 @@ pub struct ResultRecord {
 
 #[derive(Debug, Clone)]
 pub enum OutOfBandRecord {
-    AsyncRecord { token: Option<u64>, kind: AsyncKind, class: AsyncClass, results: Value },
+    AsyncRecord {
+        #[allow(dead_code)]
+        token: Option<u64>,
+        #[allow(dead_code)]
+        kind: AsyncKind,
+        class: AsyncClass,
+        results: Value,
+    },
     StreamRecord { kind: StreamKind, data: String },
 }
 
@@ -243,7 +250,7 @@ enum StringFragment<'a> {
 
 /// Combine parse_literal, parse_escaped_whitespace, and parse_escaped_char
 /// into a StringFragment.
-fn parse_fragment(input: &str) -> IResult<&str, StringFragment> {
+fn parse_fragment(input: &str) -> IResult<&str, StringFragment<'_>> {
     alt((
         map(literal, |s| StringFragment::Literal(s)),
         map(escaped_char, |c| StringFragment::EscapedChar(c)),
@@ -271,12 +278,6 @@ fn to_map(v: Vec<(String, Value)>) -> Map<String, Value> {
     Map::from_iter(v.into_iter())
 }
 
-fn to_list(v: Vec<(String, Value)>) -> Vec<Value> {
-    //The gdbmi-grammar is really weird...
-    //TODO: fix this and parse the map directly
-    v.into_iter().map(|(_, value)| value).collect()
-}
-
 fn json_value(input: &str) -> IResult<&str, Value> {
     alt((
         map(string, Value::String),
@@ -287,7 +288,7 @@ fn json_value(input: &str) -> IResult<&str, Value> {
             Value::Array(values)
         }),
         map(delimited(char('['), separated_list0(char(','), key_value), char(']')), |values| {
-            Value::Array(to_list(values))
+            Value::Object(to_map(values))
         }),
     ))
     .parse(input)

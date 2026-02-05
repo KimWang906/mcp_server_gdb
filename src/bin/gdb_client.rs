@@ -1,10 +1,8 @@
-use std::any::Any;
-
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::{Parser, ValueEnum};
-use mcp_core::client::{Client, ClientBuilder};
-use mcp_core::transport::{ClientSseTransport, ClientSseTransportBuilder, ClientStdioTransport};
-use mcp_core::types::{ClientCapabilities, Implementation, ToolResponseContent};
+use rmcp::ServiceExt;
+use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Content, Implementation, ProtocolVersion};
+use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use serde_json::{Value, json};
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
@@ -33,7 +31,7 @@ struct Args {
     server_host: String,
 
     /// Server port (only for SSE transport)
-    #[arg(long, default_value = "8080")]
+    #[arg(long, default_value = "7071")]
     server_port: u16,
 
     /// Executable file path
@@ -41,23 +39,22 @@ struct Args {
     executable: Option<String>,
 }
 
-// Helper function to call the call_tool method on any type of client
 async fn call_tool(
-    client: &Box<dyn Any>,
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ClientInfo>,
     tool_name: &str,
     params: Option<Value>,
-) -> Result<Vec<ToolResponseContent>> {
+) -> Result<Vec<Content>> {
     info!("Calling tool: {}", tool_name);
     debug!("Params: {:?}", params);
-    if let Some(client) = client.downcast_ref::<Client<ClientStdioTransport>>() {
-        let response = client.call_tool(tool_name, params).await?;
-        Ok(response.content)
-    } else if let Some(client) = client.downcast_ref::<Client<ClientSseTransport>>() {
-        let response = client.call_tool(tool_name, params).await?;
-        Ok(response.content)
-    } else {
-        bail!("Unknown client type")
-    }
+    let arguments = params.map(rmcp::model::object);
+    let request = CallToolRequestParams {
+        meta: None,
+        name: tool_name.to_string().into(),
+        arguments,
+        task: None,
+    };
+    let response = client.peer().call_tool(request).await?;
+    Ok(response.content)
 }
 
 #[tokio::main]
@@ -76,37 +73,32 @@ async fn main() -> Result<()> {
 
     info!("Starting GDB client");
 
-    // Create client based on transport type
-    let client: Box<dyn Any> = match args.transport {
+    let client_info = ClientInfo {
+        meta: None,
+        protocol_version: ProtocolVersion::V_2024_11_05,
+        capabilities: ClientCapabilities::default(),
+        client_info: Implementation {
+            name: "gdb-client".to_string(),
+            title: None,
+            version: "1.0".to_string(),
+            icons: None,
+            website_url: None,
+        },
+    };
+
+    let client = match args.transport {
         TransportType::Stdio => {
-            let transport = ClientStdioTransport::new(
-                "./target/debug/mcp-server-gdb",
-                &["--log-level", "debug"],
+            let transport = TokioChildProcess::new(
+                tokio::process::Command::new("./target/debug/mcp-server-gdb").configure(|cmd| {
+                    cmd.arg("--log-level").arg("debug");
+                }),
             )?;
-            let client = ClientBuilder::new(transport).build();
-
-            // Connect to server
-            client.open().await?;
-
-            // Initialize client
-            client
-                .initialize(
-                    Implementation { name: "gdb-client".to_string(), version: "1.0".to_string() },
-                    ClientCapabilities::default(),
-                )
-                .await?;
-
-            Box::new(client)
+            client_info.clone().serve(transport).await?
         }
         TransportType::Sse => {
-            let url = format!("http://{}:{}", args.server_host, args.server_port);
-            let transport = ClientSseTransportBuilder::new(url).build();
-            let client = ClientBuilder::new(transport).build();
-
-            // Connect to server
-            client.open().await?;
-
-            Box::new(client)
+            let url = format!("http://{}:{}/mcp", args.server_host, args.server_port);
+            let transport = StreamableHttpClientTransport::from_uri(url);
+            client_info.clone().serve(transport).await?
         }
     };
 
@@ -123,13 +115,15 @@ async fn main() -> Result<()> {
     info!("Session creation response: {:?}", session_response);
 
     // Extract session ID from response
-    let content = session_response.first().unwrap();
-    let session_id;
-    if let ToolResponseContent::Text { text } = content {
-        session_id = text.split_once(": ").unwrap().1.split('"').next().unwrap();
-    } else {
-        bail!("Unable to parse session ID");
-    }
+    let content = session_response.first().ok_or_else(|| anyhow::anyhow!("No session response"))?;
+    let text = content
+        .as_text()
+        .map(|text| text.text.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Unable to parse session response"))?;
+    let session_id = text
+        .split_once(": ")
+        .and_then(|(_, rest)| rest.split('"').next())
+        .ok_or_else(|| anyhow::anyhow!("Unable to parse session ID"))?;
 
     info!("Session ID: {}", session_id);
 
@@ -151,8 +145,7 @@ async fn main() -> Result<()> {
         &client,
         "start_debugging",
         Some(json!({
-            "session_id": session_id,
-            "timeout": 10
+            "session_id": session_id
         })),
     )
     .await?;

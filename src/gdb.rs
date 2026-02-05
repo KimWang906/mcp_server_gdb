@@ -1,18 +1,20 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use portable_pty::{PtyPair, PtySize, native_pty_system};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::TRANSPORT;
 use crate::config::Config;
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ResultContextExt};
 use crate::mi::commands::{BreakPointLocation, BreakPointNumber, MiCommand, RegisterFormat};
-use crate::mi::output::{OutOfBandRecord, ResultClass, ResultRecord};
+use crate::mi::output::{OutOfBandRecord, ResultClass, ResultRecord, StreamKind};
 use crate::mi::{GDB, GDBBuilder};
 use crate::models::{
     BreakPoint, GDBSession, GDBSessionStatus, Memory, Register, StackFrame, Variable,
@@ -35,6 +37,17 @@ struct GDBSessionHandle {
     gdb: GDB,
     /// OOB handle
     oob_handle: JoinHandle<()>,
+    /// Buffered console output from GDB/GEF commands
+    stream_buffer: Arc<Mutex<Vec<String>>>,
+    /// PTY master/slave pair for inferior I/O
+    #[allow(dead_code)]
+    pty_pair: Option<PtyPair>,
+    /// PTY reader task handle
+    pty_read_handle: Option<JoinHandle<()>>,
+    /// PTY writer for inferior stdin
+    pty_writer: Option<Box<dyn Write + Send>>,
+    /// Buffered inferior output from PTY master
+    inferior_output: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 impl GDBManager {
@@ -55,9 +68,92 @@ impl GDBManager {
         args: Option<Vec<OsString>>,
         tty: Option<PathBuf>,
         gdb_path: Option<PathBuf>,
+        gef_script: Option<PathBuf>,
+        gef_rc: Option<PathBuf>,
+        create_pty: Option<bool>,
     ) -> AppResult<String> {
         // Generate unique session ID
         let session_id = Uuid::new_v4().to_string();
+
+        let mut pty_pair: Option<PtyPair> = None;
+        let mut pty_writer: Option<Box<dyn Write + Send>> = None;
+        let mut pty_read_handle: Option<JoinHandle<()>> = None;
+        let mut inferior_output: Option<Arc<Mutex<Vec<u8>>>> = None;
+        let create_pty = create_pty.unwrap_or(false);
+        let mut tty_path = tty;
+
+        if create_pty {
+            if tty_path.is_some() {
+                return Err(AppError::invalid_argument(
+                    "gdb.create_session",
+                    "Cannot combine create_pty with an explicit tty path",
+                ));
+            }
+            let pty_system = native_pty_system();
+            let pair = pty_system
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .context("gdb.create_session", "open PTY")?;
+
+            let slave_name = {
+                #[cfg(unix)]
+                {
+                    pair.master.tty_name().ok_or_else(|| {
+                        AppError::backend(
+                            "gdb.create_session",
+                            "Failed to resolve PTY slave name",
+                        )
+                    })?
+                }
+                #[cfg(windows)]
+                {
+                    return Err(AppError::invalid_argument(
+                        "gdb.create_session",
+                        "PTY auto-creation is not supported on Windows yet",
+                    ));
+                }
+            };
+            tty_path = Some(slave_name);
+
+            let reader = pair
+                .master
+                .try_clone_reader()
+                .context("gdb.create_session", "clone PTY reader")?;
+            let writer = pair
+                .master
+                .take_writer()
+                .context("gdb.create_session", "take PTY writer")?;
+
+            let output_buffer = Arc::new(Mutex::new(Vec::new()));
+            let output_clone = output_buffer.clone();
+
+            let reader_handle = tokio::task::spawn_blocking(move || {
+                let mut reader = reader;
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let mut output = output_clone.blocking_lock();
+                            output.extend_from_slice(&buf[..n]);
+                        }
+                        Err(err) => {
+                            warn!("PTY read error: {}", err);
+                            break;
+                        }
+                    }
+                }
+            });
+
+            pty_pair = Some(pair);
+            pty_writer = Some(writer);
+            pty_read_handle = Some(reader_handle);
+            inferior_output = Some(output_buffer);
+        }
 
         let gdb_builder = GDBBuilder {
             gdb_path: gdb_path.unwrap_or_else(|| PathBuf::from("gdb")),
@@ -73,31 +169,31 @@ impl GDBManager {
             opt_source_dir: source_dir,
             opt_args: args.unwrap_or(vec![]),
             opt_program: program,
-            opt_tty: tty,
+            opt_tty: tty_path,
+            opt_gef_script: gef_script,
+            opt_gef_rc: gef_rc,
+            opt_create_pty: create_pty,
         };
 
         let (oob_src, mut oob_sink) = mpsc::channel(100);
-        let gdb = gdb_builder.try_spawn(oob_src)?;
+        let gdb = gdb_builder
+            .try_spawn(oob_src)
+            .context("gdb.create_session", "spawn GDB process")?;
 
+        let stream_buffer = Arc::new(Mutex::new(Vec::new()));
+        let stream_buffer_clone = stream_buffer.clone();
         let oob_handle = tokio::spawn(async move {
             loop {
                 match oob_sink.recv().await {
                     Some(record) => match record {
                         OutOfBandRecord::AsyncRecord { results, .. } => {
-                            let transport = TRANSPORT.lock().await;
-                            if let Some(transport) = transport.as_ref() {
-                                if let Err(e) = transport
-                                    .send_notification("create_session", Some(results))
-                                    .await
-                                {
-                                    error!("Failed to send ping to session: {:?}", e);
-                                }
-                            } else {
-                                warn!("Sink Channel closed");
-                                break;
-                            }
+                            debug!("AsyncRecord: {:?}", results);
                         }
-                        OutOfBandRecord::StreamRecord { data, .. } => {
+                        OutOfBandRecord::StreamRecord { kind, data } => {
+                            if matches!(kind, StreamKind::Console | StreamKind::Log) {
+                                let mut buffer = stream_buffer_clone.lock().await;
+                                buffer.push(data.clone());
+                            }
                             debug!("StreamRecord: {:?}", data);
                         }
                     },
@@ -117,7 +213,16 @@ impl GDBManager {
         };
 
         // Store session
-        let handle = GDBSessionHandle { info: session, gdb, oob_handle };
+        let handle = GDBSessionHandle {
+            info: session,
+            gdb,
+            oob_handle,
+            stream_buffer,
+            pty_pair,
+            pty_read_handle,
+            pty_writer,
+            inferior_output,
+        };
 
         self.sessions.lock().await.insert(session_id.clone(), handle);
 
@@ -137,9 +242,12 @@ impl GDBManager {
     /// Get specific session
     pub async fn get_session(&self, session_id: &str) -> AppResult<GDBSession> {
         let sessions = self.sessions.lock().await;
-        let handle = sessions
-            .get(session_id)
-            .ok_or_else(|| AppError::NotFound(format!("Session {} does not exist", session_id)))?;
+        let handle = sessions.get(session_id).ok_or_else(|| {
+            AppError::not_found(
+                "gdb.get_session",
+                format!("Session {} does not exist", session_id),
+            )
+        })?;
         Ok(handle.info.clone())
     }
 
@@ -159,6 +267,9 @@ impl GDBManager {
 
         if let Some(handle) = handle {
             handle.oob_handle.abort();
+            if let Some(pty_handle) = handle.pty_read_handle {
+                pty_handle.abort();
+            }
             // Terminate process
             let mut process = handle.gdb.process.lock().await;
             let _ = process.kill().await; // Ignore possible errors, process may have already terminated
@@ -174,9 +285,12 @@ impl GDBManager {
         command: &MiCommand,
     ) -> AppResult<ResultRecord> {
         let mut sessions = self.sessions.lock().await;
-        let handle = sessions
-            .get_mut(session_id)
-            .ok_or_else(|| AppError::NotFound(format!("Session {} does not exist", session_id)))?;
+        let handle = sessions.get_mut(session_id).ok_or_else(|| {
+            AppError::not_found(
+                "gdb.send_command",
+                format!("Session {} does not exist", session_id),
+            )
+        })?;
 
         let record = handle.gdb.execute(command).await?;
         let output = record.results.to_string();
@@ -200,7 +314,7 @@ impl GDBManager {
         {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(AppError::GDBTimeout),
+            Err(_) => Err(AppError::timeout("gdb.send_command", "GDB command timeout")),
         }
     }
 
@@ -236,12 +350,14 @@ impl GDBManager {
         let response =
             self.send_command_with_timeout(session_id, &MiCommand::breakpoints_list()).await?;
 
-        let table = response
-            .results
-            .get("BreakpointTable")
-            .ok_or(AppError::NotFound("BreakpointTable not found".to_string()))?;
-        let body = table.get("body").ok_or(AppError::NotFound("body not found".to_string()))?;
-        Ok(serde_json::from_value(body.to_owned())?)
+        let table = response.results.get("BreakpointTable").ok_or_else(|| {
+            AppError::not_found("gdb.get_breakpoints", "BreakpointTable not found")
+        })?;
+        let body = table
+            .get("body")
+            .ok_or_else(|| AppError::not_found("gdb.get_breakpoints", "body not found"))?;
+        Ok(serde_json::from_value(body.to_owned())
+            .context("gdb.get_breakpoints", "parse breakpoint table")?)
     }
 
     /// Set breakpoint
@@ -258,9 +374,12 @@ impl GDBManager {
             response
                 .results
                 .get("bkpt")
-                .ok_or(AppError::NotFound("bkpt not found in the result".to_string()))?
+                .ok_or_else(|| {
+                    AppError::not_found("gdb.set_breakpoint", "bkpt not found in the result")
+                })?
                 .to_owned(),
-        )?)
+        )
+        .context("gdb.set_breakpoint", "parse breakpoint result")?)
     }
 
     /// Delete breakpoint
@@ -273,11 +392,15 @@ impl GDBManager {
             breakpoints
                 .iter()
                 .map(|num| serde_json::from_str::<BreakPointNumber>(num))
-                .collect::<Result<Vec<_>, _>>()?,
+                .collect::<Result<Vec<_>, _>>()
+                .context("gdb.delete_breakpoint", "parse breakpoint numbers")?,
         );
         let response = self.send_command_with_timeout(session_id, &command).await?;
         if response.class != ResultClass::Done {
-            return Err(AppError::GDBError(response.results.to_string()));
+            return Err(AppError::backend(
+                "gdb.delete_breakpoint",
+                response.results.to_string(),
+            ));
         }
 
         Ok(())
@@ -292,9 +415,10 @@ impl GDBManager {
             response
                 .results
                 .get("stack")
-                .ok_or(AppError::NotFound("stack not found".to_string()))?
+                .ok_or_else(|| AppError::not_found("gdb.get_stack_frames", "stack not found"))?
                 .to_owned(),
-        )?)
+        )
+        .context("gdb.get_stack_frames", "parse stack frames")?)
     }
 
     /// Get local variables
@@ -310,9 +434,12 @@ impl GDBManager {
             response
                 .results
                 .get("variables")
-                .ok_or(AppError::NotFound("expect variables in result".to_string()))?
+                .ok_or_else(|| {
+                    AppError::not_found("gdb.get_local_variables", "expect variables in result")
+                })?
                 .to_owned(),
-        )?)
+        )
+        .context("gdb.get_local_variables", "parse variables")?)
     }
 
     /// Get registers
@@ -323,16 +450,20 @@ impl GDBManager {
     ) -> AppResult<Vec<Register>> {
         let reg_list = reg_list
             .map(|s| s.iter().map(|num| num.parse::<usize>()).collect::<Result<Vec<_>, _>>())
-            .transpose()?;
+            .transpose()
+            .context("gdb.get_registers", "parse register list")?;
         let command = MiCommand::data_list_register_names(reg_list.clone());
         let response = self.send_command_with_timeout(session_id, &command).await?;
         let names: Vec<String> = serde_json::from_value(
             response
                 .results
                 .get("register-names")
-                .ok_or(AppError::NotFound("register-names not found".to_string()))?
+                .ok_or_else(|| {
+                    AppError::not_found("gdb.get_registers", "register-names not found")
+                })?
                 .to_owned(),
-        )?;
+        )
+        .context("gdb.get_registers", "parse register names")?;
 
         let command = MiCommand::data_list_register_values(RegisterFormat::Hex, reg_list);
         let response = self.send_command_with_timeout(session_id, &command).await?;
@@ -341,9 +472,12 @@ impl GDBManager {
             response
                 .results
                 .get("register-values")
-                .ok_or(AppError::NotFound("expect register-values".to_string()))?
+                .ok_or_else(|| {
+                    AppError::not_found("gdb.get_registers", "expect register-values")
+                })?
                 .to_owned(),
-        )?;
+        )
+        .context("gdb.get_registers", "parse register values")?;
         Ok(registers
             .into_iter()
             .map(|mut r| {
@@ -361,7 +495,8 @@ impl GDBManager {
     ) -> AppResult<Vec<Register>> {
         let reg_list = reg_list
             .map(|s| s.iter().map(|num| num.parse::<usize>()).collect::<Result<Vec<_>, _>>())
-            .transpose()?;
+            .transpose()
+            .context("gdb.get_register_names", "parse register list")?;
         let command = MiCommand::data_list_register_names(reg_list);
         let response = self.send_command_with_timeout(session_id, &command).await?;
 
@@ -369,9 +504,12 @@ impl GDBManager {
             response
                 .results
                 .get("register-values")
-                .ok_or(AppError::NotFound("expect register-values".to_string()))?
+                .ok_or_else(|| {
+                    AppError::not_found("gdb.get_register_names", "expect register-values")
+                })?
                 .to_owned(),
-        )?)
+        )
+        .context("gdb.get_register_names", "parse register names")?)
     }
 
     /// Read memory contents
@@ -389,9 +527,10 @@ impl GDBManager {
             response
                 .results
                 .get("memory")
-                .ok_or(AppError::NotFound("expect memory".to_string()))?
+                .ok_or_else(|| AppError::not_found("gdb.read_memory", "expect memory"))?
                 .to_owned(),
-        )?)
+        )
+        .context("gdb.read_memory", "parse memory result")?)
     }
 
     /// Continue execution
@@ -420,5 +559,91 @@ impl GDBManager {
         let response = self.send_command_with_timeout(session_id, &MiCommand::exec_next()).await?;
 
         Ok(response.results.to_string())
+    }
+
+    /// Execute a CLI command via GDB/GEF and return console output.
+    pub async fn execute_cli(&self, session_id: &str, command: &str) -> AppResult<String> {
+        {
+            let mut sessions = self.sessions.lock().await;
+            let handle = sessions.get_mut(session_id).ok_or_else(|| {
+                AppError::not_found(
+                    "gdb.execute_cli",
+                    format!("Session {} does not exist", session_id),
+                )
+            })?;
+            handle.stream_buffer.lock().await.clear();
+        }
+
+        let mi_command = MiCommand::cli_exec(command);
+        let _ = self.send_command_with_timeout(session_id, &mi_command).await?;
+
+        let mut sessions = self.sessions.lock().await;
+        let handle = sessions.get_mut(session_id).ok_or_else(|| {
+            AppError::not_found(
+                "gdb.execute_cli",
+                format!("Session {} does not exist", session_id),
+            )
+        })?;
+        let mut buffer = handle.stream_buffer.lock().await;
+        let output = buffer.join("");
+        buffer.clear();
+        Ok(output)
+    }
+
+    /// Read buffered inferior output from the PTY master.
+    pub async fn get_inferior_output(&self, session_id: &str) -> AppResult<String> {
+        let mut sessions = self.sessions.lock().await;
+        let handle = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| {
+                AppError::not_found(
+                    "gdb.get_inferior_output",
+                    format!("Session {} does not exist", session_id),
+                )
+            })?;
+        let output = handle.inferior_output.as_ref().ok_or_else(|| {
+            AppError::invalid_argument("gdb.get_inferior_output", "PTY is not enabled for this session")
+        })?;
+        let mut buffer = output.lock().await;
+        if buffer.is_empty() {
+            return Ok(String::new());
+        }
+        let data = std::mem::take(&mut *buffer);
+        Ok(String::from_utf8_lossy(&data).to_string())
+    }
+
+    /// Send input to the inferior process via PTY.
+    pub async fn send_inferior_input(&self, session_id: &str, input: &str) -> AppResult<()> {
+        let mut sessions = self.sessions.lock().await;
+        let handle = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| {
+                AppError::not_found(
+                    "gdb.send_inferior_input",
+                    format!("Session {} does not exist", session_id),
+                )
+            })?;
+        let writer = handle.pty_writer.as_mut().ok_or_else(|| {
+            AppError::invalid_argument("gdb.send_inferior_input", "PTY is not enabled for this session")
+        })?;
+        writer
+            .write_all(input.as_bytes())
+            .context("gdb.send_inferior_input", "write PTY input")?;
+        writer.flush().context("gdb.send_inferior_input", "flush PTY input")?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pty_creation() {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .expect("openpty failed");
+        assert!(pair.master.try_clone_reader().is_ok());
     }
 }

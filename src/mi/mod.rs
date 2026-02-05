@@ -15,9 +15,11 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::{self, Sender};
 use tracing::debug;
 
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ResultContextExt};
 
 #[allow(clippy::upper_case_acronyms)]
+#[derive(Debug)]
+#[allow(dead_code)]
 pub struct GDB {
     pub process: Arc<Mutex<Child>>,
     is_running: Arc<AtomicBool>,
@@ -28,6 +30,7 @@ pub struct GDB {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
 pub enum ExecuteError {
     Busy,
     Quit,
@@ -65,9 +68,16 @@ pub struct GDBBuilder {
     pub opt_program: Option<PathBuf>,
     /// Use TTY for input/output by the program being debugged (--tty=TTY)
     pub opt_tty: Option<PathBuf>,
+    /// Load GEF script via -x option (e.g. vendor/gef/gef.py)
+    pub opt_gef_script: Option<PathBuf>,
+    /// Load GEF rc file via GEF_RC environment variable
+    pub opt_gef_rc: Option<PathBuf>,
+    /// Automatically create a PTY for inferior I/O separation
+    pub opt_create_pty: bool,
 }
 
 impl GDBBuilder {
+    #[allow(dead_code)]
     pub fn new(gdb: PathBuf) -> Self {
         GDBBuilder {
             gdb_path: gdb,
@@ -84,6 +94,9 @@ impl GDBBuilder {
             opt_args: Vec::new(),
             opt_program: None,
             opt_tty: None,
+            opt_gef_script: None,
+            opt_gef_rc: None,
+            opt_create_pty: false,
         }
     }
 
@@ -132,14 +145,26 @@ impl GDBBuilder {
         if let Some(tty) = self.opt_tty {
             gdb_args.push("--tty=".into());
             gdb_args.last_mut().unwrap().push(&tty);
+        } else if self.opt_create_pty {
+            return Err(AppError::invalid_argument(
+                "mi.spawn",
+                "PTY creation requested but no TTY path was configured",
+            ));
+        }
+        if let Some(gef_script) = self.opt_gef_script {
+            gdb_args.push("-x".into());
+            gdb_args.push(gef_script.into_os_string());
         }
         if !self.opt_args.is_empty() {
             gdb_args.push("--args".into());
             gdb_args.push(
                 self.opt_program
-                    .ok_or(AppError::InvalidArgument(
-                        "Program path is required if --args is provided".to_string(),
-                    ))?
+                    .ok_or_else(|| {
+                        AppError::invalid_argument(
+                            "mi.spawn",
+                            "Program path is required if --args is provided",
+                        )
+                    })?
                     .into_os_string(),
             );
             for arg in self.opt_args {
@@ -150,6 +175,9 @@ impl GDBBuilder {
         }
 
         let mut command = Command::new(self.gdb_path.clone());
+        if let Some(gef_rc) = &self.opt_gef_rc {
+            command.env("GEF_RC", gef_rc);
+        }
         command.arg("--interpreter=mi").args(gdb_args);
 
         debug!("Starting GDB process with command: {:?}", command);
@@ -159,7 +187,9 @@ impl GDBBuilder {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| AppError::GDBError(format!("Failed to start GDB process: {}", e)))?;
+            .map_err(|e| {
+                AppError::backend("mi.spawn", format!("Failed to start GDB process: {}", e))
+            })?;
 
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let is_running = Arc::new(AtomicBool::new(false));
@@ -181,6 +211,7 @@ impl GDBBuilder {
 
 impl GDB {
     #[cfg(unix)]
+    #[allow(dead_code)]
     pub async fn interrupt_execution(&self) -> Result<(), nix::Error> {
         use nix::sys::signal;
         use nix::unistd::Pid;
@@ -188,14 +219,17 @@ impl GDB {
     }
 
     #[cfg(windows)]
+    #[allow(dead_code)]
     pub async fn interrupt_execution(&self) -> Result<()> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn binary_path(&self) -> &Path {
         &self.binary_path
     }
 
+    #[allow(dead_code)]
     pub fn init_options(&self) -> &[OsString] {
         &self.init_options
     }
@@ -213,7 +247,7 @@ impl GDB {
         command: C,
     ) -> AppResult<output::ResultRecord> {
         if self.is_running() {
-            return Err(AppError::GDBBusy);
+            return Err(AppError::busy("mi.execute", "GDB is busy"));
         }
 
         let command_token = self.new_token();
@@ -227,11 +261,11 @@ impl GDB {
                     .await
                     .stdin
                     .as_mut()
-                    .ok_or_else(|| AppError::GDBError("Failed to get stdin".to_string()))?,
+                    .ok_or_else(|| AppError::backend("mi.execute", "Failed to get stdin"))?,
                 command_token,
             )
             .await
-            .expect("write interpreter command");
+            .context("mi.execute", "write interpreter command")?;
 
         match self.result_output.recv().await {
             Some(record) => match record.token {
@@ -239,45 +273,73 @@ impl GDB {
                     if token == command_token {
                         Ok(record)
                     } else {
-                        Err(AppError::InvalidArgument(format!(
-                            "Unexpected command token: {}",
-                            token
-                        )))
+                        Err(AppError::invalid_argument(
+                            "mi.execute",
+                            format!("Unexpected command token: {}", token),
+                        ))
                     }
                 }
                 None if command.borrow().operation.is_empty() => Ok(record),
-                None => Err(AppError::GDBError(format!(
-                    "No command token, expecting {}",
-                    command_token
-                ))),
+                None => Err(AppError::backend(
+                    "mi.execute",
+                    format!("No command token, expecting {}", command_token),
+                )),
             },
-            None => Err(AppError::GDBError("no result, expecting {}".to_string())),
+            None => Err(AppError::backend("mi.execute", "no result, expecting response")),
         }
     }
 
-    pub async fn execute_later<C: std::borrow::Borrow<commands::MiCommand>>(&mut self, command: C) {
+    #[allow(dead_code)]
+    pub async fn execute_later<C: std::borrow::Borrow<commands::MiCommand>>(
+        &mut self,
+        command: C,
+    ) -> AppResult<()> {
         let command_token = self.new_token();
         command
             .borrow()
             .write_interpreter_string(
-                &mut self.process.lock().await.stdin.as_mut().unwrap(),
+                &mut self
+                    .process
+                    .lock()
+                    .await
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| AppError::backend("mi.execute_later", "Failed to get stdin"))?,
                 command_token,
             )
             .await
-            .expect("write interpreter command");
+            .context("mi.execute_later", "write interpreter command")?;
         let _ = self.result_output.recv().await;
+        Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn is_session_active(&mut self) -> AppResult<bool> {
         let res = self.execute(commands::MiCommand::thread_info(None)).await?;
         if let Some(threads) = res.results.get("threads") {
             if let Some(threads) = threads.as_array() {
                 Ok(!threads.is_empty())
             } else {
-                Err(AppError::GDBError("threads is not an array".to_string()))
+                Err(AppError::protocol("mi.is_session_active", "threads is not an array"))
             }
         } else {
-            Err(AppError::GDBError("threads is not found".to_string()))
+            Err(AppError::protocol("mi.is_session_active", "threads is not found"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_builder_create_pty_requires_tty() {
+        let mut builder = GDBBuilder::new(PathBuf::from("gdb"));
+        builder.opt_create_pty = true;
+
+        let (oob_tx, _oob_rx) = mpsc::channel(1);
+        let err = builder.try_spawn(oob_tx).expect_err("expected error");
+
+        assert_eq!(err.kind, crate::error::ErrorKind::InvalidArgument);
     }
 }

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::ffi::OsString;
 use std::fmt;
 use std::io::Error;
@@ -217,7 +219,7 @@ impl MiCommand {
     pub fn data_evaluate_expression(expression: String) -> MiCommand {
         MiCommand {
             operation: "data-evaluate-expression",
-            options: Some(vec![OsString::from(format!("\"{}\"", expression))]), /* TODO: maybe we need to quote existing " in expression. Is this even possible? */
+            options: Some(vec![OsString::from(escape_command(&expression))]),
             parameters: None,
         }
     }
@@ -533,5 +535,20 @@ impl MiCommand {
     /// Empty command, used for testing purposes
     pub fn empty() -> MiCommand {
         MiCommand { operation: "", ..Default::default() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_exec_wraps_command() {
+        let cmd = MiCommand::cli_exec("help");
+        assert_eq!(cmd.operation, "interpreter-exec");
+
+        let options = cmd.options.expect("options");
+        assert_eq!(options[0], OsString::from("console"));
+        assert_eq!(options[1], OsString::from("\"help\""));
     }
 }

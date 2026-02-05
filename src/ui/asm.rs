@@ -1,31 +1,40 @@
+use std::sync::atomic::Ordering;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::prelude::Stylize;
 use ratatui::style::Style;
-use ratatui::widgets::block::Title;
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
 
 use super::{GREEN, ORANGE, PURPLE};
 use crate::App;
 
-pub fn draw_asm<'a>(app: &App, f: &mut Frame<'a>, asm: Rect) {
+pub fn draw_asm<'a>(app: &mut App, f: &mut Frame<'a>, asm: Rect) {
     // Asm
-    // TODO: cache the pc_index if this doesn't change
     let mut rows = vec![];
-    let mut pc_index = None;
-    let mut function_name = None;
-    let mut tallest_function_len = 0;
+    let app_cur = app.current_pc.load(Ordering::Relaxed);
+    let cache_valid = app.asm_cache.len == app.asm.len()
+        && app.asm_cache.pc == app_cur
+        && app.asm_cache.pc_index.map_or(true, |idx| {
+            app.asm.get(idx).map_or(false, |a| a.address == app_cur)
+        });
+    let mut pc_index = if cache_valid { app.asm_cache.pc_index } else { None };
+    let mut function_name = if cache_valid {
+        app.asm_cache.function_name.clone()
+    } else {
+        None
+    };
+    let mut tallest_function_len =
+        if cache_valid { app.asm_cache.tallest_function_len } else { 0 };
 
     // Display asm, this will already be in a sorted order
-    let app_cur = app.current_pc;
     for (index, a) in app.asm.iter().enumerate() {
-        if a.address == app_cur {
+        if !cache_valid && a.address == app_cur {
             pc_index = Some(index);
             if let Some(func_name) = &a.func_name {
                 function_name = Some(func_name.clone());
-                if func_name.len() > tallest_function_len {
-                    tallest_function_len = func_name.len();
-                }
+                tallest_function_len = func_name.len();
             }
         }
         let addr_cell =
@@ -54,10 +63,18 @@ pub fn draw_asm<'a>(app: &App, f: &mut Frame<'a>, asm: Rect) {
         rows.push(Row::new(row));
     }
 
+    if !cache_valid {
+        app.asm_cache.pc = app_cur;
+        app.asm_cache.len = app.asm.len();
+        app.asm_cache.pc_index = pc_index;
+        app.asm_cache.function_name = function_name.clone();
+        app.asm_cache.tallest_function_len = tallest_function_len;
+    }
+
     let tital = if let Some(function_name) = function_name {
-        Title::from(format!("Instructions ({})", function_name).fg(ORANGE))
+        Line::from(format!("Instructions ({})", function_name)).fg(ORANGE)
     } else {
-        Title::from("Instructions".fg(ORANGE))
+        Line::from("Instructions").fg(ORANGE)
     };
     if let Some(pc_index) = pc_index {
         let widths = [

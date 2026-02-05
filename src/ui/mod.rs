@@ -6,7 +6,7 @@ use ratatui::layout::Layout;
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
-use crate::models::{MemoryType, ResolveSymbol};
+use mcp_server_gdb::models::{MemoryType, ResolveSymbol};
 use crate::{App, Mode};
 
 pub mod asm;
@@ -36,14 +36,17 @@ const STRING_COLOR: Color = YELLOW;
 const ASM_COLOR: Color = ORANGE;
 
 const SAVED_OUTPUT: usize = 10;
+const DEFAULT_REGISTER_ROWS: u16 = 10;
+const MAX_REGISTER_ROWS_32: usize = 12;
+const MAX_REGISTER_ROWS_64: usize = 16;
 
+#[allow(dead_code)]
 /// Amount of stack addresses we save/display
 pub const SAVED_STACK: u16 = 14;
 
 pub const SCROLL_CONTROL_TEXT: &str = "(up(k), down(j), 50 up(K), 50 down(J), top(g), bottom(G))";
 
 pub fn ui<'a>(f: &mut Frame<'a>, app: &mut App) {
-    // TODO: register size should depend on arch
     let top_size = Fill(1);
 
     // If only output, then no top and fill all with output
@@ -88,7 +91,14 @@ pub fn ui<'a>(f: &mut Frame<'a>, app: &mut App) {
 
     match app.mode {
         Mode::All => {
-            let register_size = Min(10);
+            let max_register_rows =
+                if app.bit32 { MAX_REGISTER_ROWS_32 } else { MAX_REGISTER_ROWS_64 };
+            let register_rows = if app.registers.is_empty() {
+                DEFAULT_REGISTER_ROWS
+            } else {
+                (app.registers.len().min(max_register_rows) as u16) + 1
+            };
+            let register_size = Min(register_rows);
             let stack_size = Length(10 + 1);
             // 5 previous, 5 now + after
             let asm_size = Length(11);

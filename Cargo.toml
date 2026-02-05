@@ -1,13 +1,13 @@
 [package]
-authors = ["Lix Zhou <xeontz@gmail.com>"]
+authors = ["Lix Zhou <xeontz@gmail.com>", "kimwang906 <kimwang0906bin@gmail.com>"]
 description = "A GDB/MI protocol server based on the MCP protocol, providing remote application debugging capabilities"
 name = "mcp-server-gdb"
 version = "0.3.0"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/pansila/mcp_server_gdb"
-homepage = "https://github.com/pansila/mcp_server_gdb"
+repository = "https://github.com/KimWang906/mcp_server_gdb"
+homepage = ""
 keywords = ["MCP", "tool", "AI", "LLM", "Agent"]
 categories = ["command-line-utilities"]
 default-run = "mcp-server-gdb"
@@ -20,21 +20,29 @@ tracing-appender = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = "3.12"
-thiserror = "1.0"
+schemars = "1.0"
+thiserror = "2.0.18"
 anyhow = "1.0"
 uuid = { version = "1.7", features = ["v4", "serde"] }
 clap = { version = "4.5",  features = ["derive"] }
 dotenv = "0.15"
-mcp-core = { version = "0.1",  features = ["sse"] }
-mcp-core-macros = "0.1"
-schemars = "0.8"
+rmcp = { version = "0.14.0", features = [
+  "client",
+  "server",
+  "transport-io",
+  "transport-child-process",
+  "transport-streamable-http-server",
+  "transport-streamable-http-client-reqwest",
+] }
 nom = "8.0"
-crossterm = { version = "0.28", features = ["event-stream"] }
-ratatui = "0.29"
+crossterm = { version = "0.29", features = ["event-stream"] }
+ratatui = "0.30"
+axum = "0.8"
 futures = "0.3"
+portable-pty = "0.9"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29.0", features = ["process", "signal"] }
+nix = { version = "0.31.1", features = ["process", "signal"] }
 openssl = { version = "0.10", features = ["vendored"] }
 
 [[bin]]
