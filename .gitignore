@@ -19,3 +19,4 @@ target/
 .env
 logs/
 .direnv/
+context.md

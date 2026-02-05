@@ -223,6 +223,74 @@
         "explanation": "Prevent regressions by systematically validating that new fixes don't introduce new errors."
       }
     },
+    "error_design": {
+      "audiences": {
+        "machines": {
+          "goal": "automated recovery",
+          "needs": [
+            "flat error kind",
+            "explicit status",
+            "retryable flag"
+          ]
+        },
+        "humans": {
+          "goal": "debugging",
+          "needs": [
+            "operation context",
+            "key/value fields",
+            "call-path frames with location"
+          ]
+        }
+      },
+      "principles": [
+        "categorize by action/response rather than origin",
+        "make retryability or status explicit (temporary, permanent, persistent)",
+        "prefer a single, flat error type per module or library",
+        "add structured context fields at the point of failure",
+        "capture lightweight location context via #[track_caller] instead of backtraces",
+        "force context at module boundaries; avoid bare ? across error domains"
+      ],
+      "anti_patterns": [
+        "forwarding raw dependency errors without context",
+        "deep error enums per dependency",
+        "type-erased errors without context",
+        "relying on backtraces for logical call path"
+      ],
+      "implementation_guidance": {
+        "error_shape": {
+          "fields": [
+            "kind",
+            "status",
+            "message",
+            "operation",
+            "context_fields",
+            "source"
+          ],
+          "kind_examples": [
+            "NotFound",
+            "PermissionDenied",
+            "RateLimited",
+            "InvalidArgument",
+            "Timeout"
+          ],
+          "status_examples": [
+            "Temporary",
+            "Permanent",
+            "Persistent"
+          ]
+        },
+        "context_api": {
+          "require_context_methods": true,
+          "preferred_method_names": [
+            "context",
+            "with_context",
+            "with_field",
+            "or_raise"
+          ],
+          "capture_location": "use #[track_caller] for frames"
+        }
+      }
+    },
     "unused_imports": {
       "strategy": "implement_or_justify",
       "actions": [
