@@ -98,6 +98,10 @@ struct Args {
     /// Enable TUI
     #[arg(long)]
     enable_tui: bool,
+
+    /// Path to GEF rc file
+    #[arg(long, value_name = "PATH")]
+    gef_rc: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Default, PartialEq)]
@@ -252,6 +256,12 @@ async fn main() -> Result<(), AppError> {
     dotenv::dotenv().ok();
 
     let args = Args::parse();
+
+    if let Some(gef_rc) = args.gef_rc.as_ref() {
+        unsafe {
+            std::env::set_var("GEF_RC", gef_rc);
+        }
+    }
 
     let file_appender = RollingFileAppender::new(Rotation::DAILY, "logs", "mcp-gdb.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);

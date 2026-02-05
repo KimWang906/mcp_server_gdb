@@ -12,7 +12,7 @@ use nom::character::complete::{alphanumeric1, space0};
 use nom::combinator::map;
 use nom::sequence::{delimited, preceded, separated_pair};
 use nom::{IResult, Parser};
-use serde::{Deserialize, Serialize, de};
+use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as, skip_serializing_none};
 use tracing::debug;
 
@@ -268,6 +268,7 @@ pub enum RegisterRaw {
     U64(Address64),
     U128(Address128),
     U256(Address128, Address128),
+    Raw(String),
 }
 
 // Define Register struct to hold register data
@@ -333,7 +334,10 @@ impl<'de> Deserialize<'de> for RegisterRaw {
         if s.starts_with("0x") {
             Ok(RegisterRaw::U64(Address64::from(s[2..].to_owned())))
         } else {
-            register_data(&s).map(|(_, o)| o).map_err(|e| de::Error::custom(e.to_string()))
+            match register_data(&s) {
+                Ok((_, o)) => Ok(o),
+                Err(_) => Ok(RegisterRaw::Raw(s)),
+            }
         }
     }
 }

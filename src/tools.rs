@@ -59,6 +59,7 @@ struct CreateSessionParams {
     gdb_path: Option<PathBuf>,
     gef_script: Option<PathBuf>,
     gef_rc: Option<PathBuf>,
+    #[schemars(description = "Automatically create a PTY for inferior I/O separation. Default: true.")]
     create_pty: Option<bool>,
 }
 
@@ -104,6 +105,7 @@ struct ReadMemoryParams {
 struct ExecuteCliParams {
     session_id: String,
     command: String,
+    json: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -117,11 +119,39 @@ struct InferiorInputParams {
 struct GefCommandParams {
     session_id: String,
     args: Option<String>,
+    json: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GefFunctionParams {
+    session_id: String,
+    json: Option<bool>,
 }
 
 fn json_text<T: Serialize>(value: &T) -> Result<String, ErrorData> {
     serde_json::to_string(value)
         .map_err(|error| ErrorData::internal_error(error.to_string(), None))
+}
+
+fn format_gef_json_cli(tool: &str, args: Option<&str>) -> String {
+    let args = args.map(str::trim).filter(|value| !value.is_empty());
+    match args {
+        Some(value) => format!("gef-json {} {}", tool, value),
+        None => format!("gef-json {}", tool),
+    }
+}
+
+fn normalize_gef_json_command(command: &str, json: bool) -> String {
+    let command = command.trim();
+    if json && !command.starts_with("gef-json") {
+        if command.is_empty() {
+            "gef-json".to_string()
+        } else {
+            format!("gef-json {}", command)
+        }
+    } else {
+        command.to_string()
+    }
 }
 
 macro_rules! gef_command_tool {
@@ -131,7 +161,10 @@ macro_rules! gef_command_tool {
             &self,
             Parameters(params): Parameters<GefCommandParams>,
         ) -> Result<String, ErrorData> {
-            let command = if let Some(args) = params.args.as_ref() {
+            let use_json = params.json.unwrap_or(false);
+            let command = if use_json {
+                format_gef_json_cli($tool_name, params.args.as_deref())
+            } else if let Some(args) = params.args.as_ref() {
                 format!("{} {}", $command, args)
             } else {
                 $command.to_string()
@@ -152,13 +185,18 @@ macro_rules! gef_function_tool {
         #[tool(name = $tool_name, description = $description)]
         async fn $fn_name(
             &self,
-            Parameters(SessionIdParams { session_id }): Parameters<SessionIdParams>,
+            Parameters(params): Parameters<GefFunctionParams>,
         ) -> Result<String, ErrorData> {
-            let command = format!("p {}", $expression);
+            let use_json = params.json.unwrap_or(false);
+            let command = if use_json {
+                format_gef_json_cli($tool_name, None)
+            } else {
+                format!("p {}", $expression)
+            };
             let output = GDB_MANAGER
-                .execute_cli(&session_id, &command)
+                .execute_cli(&params.session_id, &command)
                 .await
-                .field("session_id", session_id.clone())
+                .field("session_id", params.session_id.clone())
                 .field("command", command.clone())
                 .map_err(ErrorData::from)?;
             Ok(output)
@@ -469,9 +507,10 @@ impl GdbService {
         &self,
         Parameters(params): Parameters<ExecuteCliParams>,
     ) -> Result<String, ErrorData> {
-        let command_field = params.command.clone();
+        let command = normalize_gef_json_command(&params.command, params.json.unwrap_or(false));
+        let command_field = command.clone();
         let output = GDB_MANAGER
-            .execute_cli(&params.session_id, &params.command)
+            .execute_cli(&params.session_id, &command)
             .await
             .field("session_id", params.session_id.clone())
             .field("command", command_field)
@@ -606,5 +645,109 @@ impl ServerHandler for GdbService {
             server_info: Implementation::from_build_env(),
             instructions: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_gef_json_cli, normalize_gef_json_command};
+
+    const TOOLS: &[&str] = &[
+        "checksec",
+        "canary",
+        "aslr",
+        "pie",
+        "vmmap",
+        "memory",
+        "hexdump",
+        "dereference",
+        "xinfo",
+        "xor-memory",
+        "heap",
+        "heap-analysis-helper",
+        "elf-info",
+        "got",
+        "xfiles",
+        "search-pattern",
+        "scan",
+        "pattern",
+        "nop",
+        "patch",
+        "stub",
+        "entry-break",
+        "name-break",
+        "skipi",
+        "stepover",
+        "trace-run",
+        "process-status",
+        "process-search",
+        "hijack-fd",
+        "context",
+        "registers",
+        "arch",
+        "eval",
+        "print-format",
+        "format-string-helper",
+        "pcustom",
+        "reset-cache",
+        "shellcode",
+        "edit-flags",
+        "functions",
+        "gef_base",
+        "gef_stack",
+        "gef_heap",
+        "gef_got",
+        "gef_bss",
+    ];
+
+    #[test]
+    fn build_json_command_includes_tool() {
+        for tool in TOOLS {
+            let cmd = format_gef_json_cli(tool, Some("arg1 arg2"));
+            assert!(cmd.starts_with("gef-json "));
+            assert!(cmd.contains(tool));
+        }
+    }
+
+    #[test]
+    fn build_json_command_handles_quotes() {
+        let cmd = format_gef_json_cli("checksec", Some("arg \"with quotes\""));
+        assert!(cmd.contains("arg \"with quotes\""));
+    }
+
+    #[test]
+    fn build_json_command_allows_null_args() {
+        let cmd = format_gef_json_cli("checksec", None);
+        assert_eq!(cmd, "gef-json checksec");
+    }
+
+    #[test]
+    fn build_json_command_trims_args() {
+        let cmd = format_gef_json_cli("checksec", Some("   "));
+        assert_eq!(cmd, "gef-json checksec");
+    }
+
+    #[test]
+    fn normalize_cli_no_json_trims_only() {
+        let cmd = normalize_gef_json_command("  checksec  ", false);
+        assert_eq!(cmd, "checksec");
+    }
+
+    #[test]
+    fn normalize_cli_json_prefixes() {
+        let cmd = normalize_gef_json_command("checksec", true);
+        assert_eq!(cmd, "gef-json checksec");
+    }
+
+    #[test]
+    fn normalize_cli_json_keeps_existing() {
+        let cmd = normalize_gef_json_command("gef-json checksec", true);
+        assert_eq!(cmd, "gef-json checksec");
+    }
+
+    #[test]
+    fn normalize_cli_json_empty() {
+        let cmd = normalize_gef_json_command("   ", true);
+        assert_eq!(cmd, "gef-json");
     }
 }

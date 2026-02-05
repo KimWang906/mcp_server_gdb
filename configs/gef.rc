@@ -1,5 +1,6 @@
 [gef]
 disable_color = True
+extra_plugins_dir = scripts
 
 [context]
 enable = False

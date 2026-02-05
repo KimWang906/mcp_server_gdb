@@ -118,6 +118,12 @@ pub async fn process_output<T: AsyncRead + Unpin>(
                     Ok(r) => r,
                     Err(e) => {
                         error!("PARSING ERROR: {}", e);
+                        let _ = out_of_band_pipe
+                            .send(OutOfBandRecord::StreamRecord {
+                                kind: StreamKind::Target,
+                                data: buffer.clone(),
+                            })
+                            .await;
                         continue;
                     }
                 };

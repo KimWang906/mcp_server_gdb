@@ -62,7 +62,7 @@ pub fn tool_router_with_gef(_attr: TokenStream, item: TokenStream) -> TokenStrea
                 Self::#ident
                     .name(#tool_name)
                     .description(#desc)
-                    .parameters::<SessionIdParams>(),
+                    .parameters::<GefFunctionParams>(),
             )
         });
     }

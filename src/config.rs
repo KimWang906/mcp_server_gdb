@@ -7,6 +7,8 @@ pub struct Config {
     pub server_port: u16,
     /// GDB command execution timeout in seconds
     pub command_timeout: u64,
+    /// Optional path to GEF rc file
+    pub gef_rc: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -21,6 +23,36 @@ impl Default for Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10),
+            gef_rc: std::env::var("GEF_RC")
+                .ok()
+                .map(std::path::PathBuf::from),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use std::env;
+    use std::path::PathBuf;
+
+    #[test]
+    fn config_reads_gef_rc_from_env() {
+        let key = "GEF_RC";
+        let original = env::var(key).ok();
+        let sample = PathBuf::from("/tmp/test-gef.rc");
+        unsafe {
+            env::set_var(key, &sample);
+        }
+        let config = Config::default();
+        assert_eq!(config.gef_rc, Some(sample));
+        match original {
+            Some(value) => unsafe {
+                env::set_var(key, value);
+            },
+            None => unsafe {
+                env::remove_var(key);
+            },
         }
     }
 }
