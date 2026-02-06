@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::error::{AppError, AppResult, ResultContextExt};
+use crate::error::{AppError, AppResult, ErrorKind, ResultContextExt};
 use crate::mi::commands::{BreakPointLocation, BreakPointNumber, MiCommand, RegisterFormat};
 use crate::mi::output::{OutOfBandRecord, ResultClass, ResultRecord, StreamKind};
 use crate::mi::{GDB, GDBBuilder};
@@ -714,7 +714,17 @@ impl GDBManager {
 
     /// Execute a CLI command via GDB/GEF and return console output.
     pub async fn execute_cli(&self, session_id: &str, command: &str) -> AppResult<String> {
-        let timeout = Duration::from_secs(self.config.command_timeout);
+        self.execute_cli_with_timeout(session_id, command, None).await
+    }
+
+    /// Execute a CLI command via GDB/GEF with an optional timeout override.
+    pub async fn execute_cli_with_timeout(
+        &self,
+        session_id: &str,
+        command: &str,
+        timeout: Option<Duration>,
+    ) -> AppResult<String> {
+        let timeout = timeout.unwrap_or_else(|| Duration::from_secs(self.config.command_timeout));
         self.ensure_stopped(session_id, timeout).await?;
 
         let commands: Vec<&str> = command
@@ -748,7 +758,21 @@ impl GDBManager {
         }
 
         let mi_command = MiCommand::cli_exec(command);
-        let _ = self.send_command_with_timeout(session_id, &mi_command).await?;
+        let mut attempt = 0;
+        loop {
+            match self.send_command_with_timeout(session_id, &mi_command).await {
+                Ok(_) => break,
+                Err(err)
+                    if attempt == 0
+                        && matches!(err.kind, ErrorKind::Busy | ErrorKind::Timeout) =>
+                {
+                    self.ensure_stopped(session_id, timeout).await?;
+                    attempt += 1;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
 
         let output_wait = std::cmp::min(timeout, Duration::from_secs(1));
         let start = Instant::now();

@@ -119,12 +119,18 @@ You can adjust server configuration by modifying the `src/config.rs` file or by 
 
 **I/O**
 - `execute_cli` - Execute a GDB/GEF CLI command in the session
+  - Parameters:
+    - `command` (string, required): CLI command (multi-line supported)
+    - `json` (bool, optional): Prefixes with `gef-json` to request structured output
+    - `timeout_seconds` (number, optional): Per-command timeout override (seconds)
 - `get_inferior_output` - Read buffered inferior output from PTY
 - `send_inferior_input` - Send input to the inferior process via PTY
 
 ### GEF Passthrough Tools
 
-These tools forward to GEF CLI commands (optionally with `args`).
+These tools forward to GEF CLI commands (optionally with `args`). All GEF passthrough tools accept:
+- `args` (string, optional): Extra CLI arguments
+- `json` (bool, optional): Use `gef-json` to return structured output (requires `scripts/gef_json.py` loaded via `configs/gef.rc` or `GEF_RC`)
 
 **Security**
 - `checksec` - Inspect binary security features

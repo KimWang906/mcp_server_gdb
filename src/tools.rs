@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::router::tool::CallToolHandlerExt;
@@ -103,9 +104,14 @@ struct ReadMemoryParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ExecuteCliParams {
+    /// Target session ID.
     session_id: String,
+    /// GDB/GEF CLI command to execute. Multi-line commands are supported.
     command: String,
+    /// If true, prefixes the command with `gef-json` to request structured output.
     json: Option<bool>,
+    /// Optional per-command timeout override (seconds). Defaults to `GDB_COMMAND_TIMEOUT`.
+    timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -117,14 +123,19 @@ struct InferiorInputParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[allow(dead_code)]
 struct GefCommandParams {
+    /// Target session ID.
     session_id: String,
+    /// Optional arguments passed to the GEF command.
     args: Option<String>,
+    /// If true, uses `gef-json` to return structured output (requires the GEF JSON script loaded).
     json: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GefFunctionParams {
+    /// Target session ID.
     session_id: String,
+    /// If true, uses `gef-json` to return structured output (requires the GEF JSON script loaded).
     json: Option<bool>,
 }
 
@@ -509,8 +520,9 @@ impl GdbService {
     ) -> Result<String, ErrorData> {
         let command = normalize_gef_json_command(&params.command, params.json.unwrap_or(false));
         let command_field = command.clone();
+        let timeout = params.timeout_seconds.map(Duration::from_secs);
         let output = GDB_MANAGER
-            .execute_cli(&params.session_id, &command)
+            .execute_cli_with_timeout(&params.session_id, &command, timeout)
             .await
             .field("session_id", params.session_id.clone())
             .field("command", command_field)

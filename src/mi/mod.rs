@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod output;
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -24,6 +25,9 @@ pub struct GDB {
     pub process: Arc<Mutex<Child>>,
     is_running: Arc<AtomicBool>,
     result_output: mpsc::Receiver<output::ResultRecord>,
+    pending_results: VecDeque<output::ResultRecord>,
+    pending_result_stash_count: u64,
+    pending_result_drop_count: u64,
     current_command_token: AtomicU64,
     binary_path: PathBuf,
     init_options: Vec<OsString>,
@@ -204,6 +208,9 @@ impl GDBBuilder {
             binary_path: self.gdb_path,
             init_options,
             result_output,
+            pending_results: VecDeque::new(),
+            pending_result_stash_count: 0,
+            pending_result_drop_count: 0,
         };
         Ok(gdb)
     }
@@ -251,6 +258,16 @@ impl GDB {
         }
 
         let command_token = self.new_token();
+        let expects_token = !command.borrow().operation.is_empty();
+
+        if let Some(record) = self
+            .pending_results
+            .iter()
+            .position(|record| record.token == Some(command_token))
+            .and_then(|pos| self.pending_results.remove(pos))
+        {
+            return Ok(record);
+        }
 
         command
             .borrow()
@@ -267,25 +284,48 @@ impl GDB {
             .await
             .context("mi.execute", "write interpreter command")?;
 
-        match self.result_output.recv().await {
-            Some(record) => match record.token {
-                Some(token) => {
-                    if token == command_token {
-                        Ok(record)
-                    } else {
-                        Err(AppError::invalid_argument(
-                            "mi.execute",
-                            format!("Unexpected command token: {}", token),
-                        ))
+        loop {
+            match self.result_output.recv().await {
+                Some(record) => match record.token {
+                    Some(token) if token == command_token => {
+                        return Ok(record);
                     }
-                }
-                None if command.borrow().operation.is_empty() => Ok(record),
-                None => Err(AppError::backend(
-                    "mi.execute",
-                    format!("No command token, expecting {}", command_token),
-                )),
-            },
-            None => Err(AppError::backend("mi.execute", "no result, expecting response")),
+                    Some(token) if token < command_token => {
+                        self.pending_result_drop_count += 1;
+                        debug!(
+                            "mi.execute: dropping stale result token {} (expecting {}), drops={}",
+                            token, command_token, self.pending_result_drop_count
+                        );
+                    }
+                    Some(token) => {
+                        if self.pending_results.len() >= 32 {
+                            let _ = self.pending_results.pop_front();
+                        }
+                        self.pending_result_stash_count += 1;
+                        if self.pending_result_stash_count == 1
+                            || self.pending_result_stash_count % 10 == 0
+                            || self.pending_results.len() > 8
+                        {
+                            debug!(
+                                "mi.execute: stashing out-of-order result token {} (expecting {}), stash_count={}, pending_len={}",
+                                token,
+                                command_token,
+                                self.pending_result_stash_count,
+                                self.pending_results.len()
+                            );
+                        }
+                        self.pending_results.push_back(record);
+                    }
+                    None if !expects_token => return Ok(record),
+                    None => {
+                        debug!(
+                            "mi.execute: dropping tokenless result (expecting {})",
+                            command_token
+                        );
+                    }
+                },
+                None => return Err(AppError::backend("mi.execute", "no result, expecting response")),
+            }
         }
     }
 
