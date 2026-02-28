@@ -19,6 +19,27 @@ use tracing::debug;
 use crate::error::AppError;
 use crate::mi::commands::BreakPointNumber;
 
+/// Identifies which debug backend is driving the session.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub enum DebugBackendKind {
+    #[default]
+    Native,
+    #[cfg(feature = "qemu-user")]
+    QemuUser,
+    #[cfg(feature = "qemu-system")]
+    QemuSystem,
+}
+
+/// Controls which MI command `start_debugging` issues.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub enum LaunchMode {
+    /// Native: -exec-run (starts the inferior from scratch)
+    #[default]
+    ExecRun,
+    /// QEMU/remote: -exec-continue (inferior already halted at entry)
+    ExecContinue,
+}
+
 /// GDB session information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GDBSession {
@@ -28,6 +49,12 @@ pub struct GDBSession {
     pub status: GDBSessionStatus,
     /// Creation time
     pub created_at: u64,
+    /// Which backend is driving this session
+    pub backend: DebugBackendKind,
+    /// Determines whether start_debugging uses exec-run or exec-continue
+    pub launch_mode: LaunchMode,
+    /// GDB remote stub port (QEMU sessions only)
+    pub qemu_port: Option<u16>,
 }
 
 /// GDB session status

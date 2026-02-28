@@ -49,6 +49,7 @@ mod issue_regressions {
                 None,
                 Some(PathBuf::from("configs/gef.rc")),
                 Some(false),
+                None, // lib_dir
             )
             .await
             .expect("create_session")

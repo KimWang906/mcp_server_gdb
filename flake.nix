@@ -54,6 +54,11 @@
           rustToolchain
           cargo
           clippy
+
+          # QEMU: user-mode + system-mode for all target architectures.
+          # Provides qemu-<arch> and qemu-system-<arch> binaries used by the
+          # qemu-user / qemu-system backend and the test suite.
+          qemu
         ];
 
         shellHook = ''

@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
         client_info: Implementation {
             name: "gdb-client".to_string(),
             title: None,
+            description: None,
             version: "1.0".to_string(),
             icons: None,
             website_url: None,

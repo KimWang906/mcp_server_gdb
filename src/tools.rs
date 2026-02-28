@@ -12,8 +12,9 @@ use mcp_server_gdb_macros::tool_router_with_gef;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ResultContextExt;
+use crate::error::{AppError, AppResult, ResultContextExt};
 use crate::gdb::GDBManager;
+use crate::models::DebugBackendKind;
 
 pub static GDB_MANAGER: LazyLock<Arc<GDBManager>> =
     LazyLock::new(|| Arc::new(GDBManager::default()));
@@ -42,26 +43,61 @@ impl Default for GdbService {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CreateSessionParams {
-    program: Option<PathBuf>,
+    // ── Target ──
+    /// ELF binary to debug. Used for architecture auto-detection.
+    /// In native sessions, equivalent to the `program` parameter (alias accepted).
+    #[serde(alias = "program")]
+    binary: Option<PathBuf>,
+
+    // ── Backend selection ──
+    /// Force a specific backend: "native" | "qemu-user" | "qemu-system".
+    /// If omitted, the backend is auto-detected from the ELF architecture.
+    backend: Option<String>,
+
+    // ── Common GDB options ──
+    gdb_path: Option<PathBuf>,
+    gef_script: Option<PathBuf>,
+    gef_rc: Option<PathBuf>,
+    symbol_file: Option<PathBuf>,
+
+    // ── Library path ──
+    /// Shared library directory.
+    /// QEMU user: passed as `qemu -L <lib_dir>` (sysroot).
+    /// Native: configures solib-search-path and LD_LIBRARY_PATH.
+    lib_dir: Option<PathBuf>,
+    /// Automatically download the matching Ubuntu libc6 package.
+    /// Requires libc-fetch feature and qemu-user backend.
+    auto_fetch_libc: Option<bool>,
+
+    // ── Native-only ──
     nh: Option<bool>,
     nx: Option<bool>,
     quiet: Option<bool>,
     cd: Option<PathBuf>,
     bps: Option<u32>,
-    symbol_file: Option<PathBuf>,
     core_file: Option<PathBuf>,
     proc_id: Option<u32>,
     command: Option<PathBuf>,
     source_dir: Option<PathBuf>,
     args: Option<Vec<String>>,
     tty: Option<PathBuf>,
-    gdb_path: Option<PathBuf>,
-    gef_script: Option<PathBuf>,
-    gef_rc: Option<PathBuf>,
     #[schemars(description = "Automatically create a PTY for inferior I/O separation. Default: true.")]
     create_pty: Option<bool>,
+
+    // ── QEMU user-mode ──
+    /// Arguments forwarded to the emulated binary.
+    binary_args: Option<Vec<String>>,
+    /// Explicit qemu-<arch> binary path. If omitted, resolved from PATH by arch.
+    qemu_path: Option<PathBuf>,
+    /// GDB remote stub port. Auto-allocated for user-mode; required for system-mode.
+    gdb_port: Option<u16>,
+
+    // ── QEMU system-mode ──
+    /// QEMU system-mode arguments. Must include `-S -gdb tcp::<gdb_port>`.
+    qemu_args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -215,67 +251,190 @@ macro_rules! gef_function_tool {
     };
 }
 
+// ─── Backend auto-detection ───────────────────────────────────────────────────
+
+/// Determine which debug backend to use based on the unified `CreateSessionParams`.
+fn determine_backend(params: &CreateSessionParams) -> AppResult<DebugBackendKind> {
+    // 1. Explicit backend override.
+    if let Some(backend_str) = &params.backend {
+        return match backend_str.as_str() {
+            "native" => Ok(DebugBackendKind::Native),
+            #[cfg(feature = "qemu-user")]
+            "qemu-user" => Ok(DebugBackendKind::QemuUser),
+            #[cfg(not(feature = "qemu-user"))]
+            "qemu-user" => Err(AppError::invalid_argument(
+                "create_session",
+                "backend 'qemu-user' requires the server to be built with --features qemu-user",
+            )),
+            #[cfg(feature = "qemu-system")]
+            "qemu-system" => Ok(DebugBackendKind::QemuSystem),
+            #[cfg(not(feature = "qemu-system"))]
+            "qemu-system" => Err(AppError::invalid_argument(
+                "create_session",
+                "backend 'qemu-system' requires the server to be built with --features qemu-system",
+            )),
+            other => Err(AppError::invalid_argument(
+                "create_session",
+                format!(
+                    "Unknown backend '{}'; valid values: native, qemu-user, qemu-system",
+                    other
+                ),
+            )),
+        };
+    }
+
+    // 2. qemu_args without an explicit backend is ambiguous.
+    if params.qemu_args.is_some() {
+        return Err(AppError::invalid_argument(
+            "create_session",
+            "qemu_args requires explicit backend = \"qemu-system\"",
+        ));
+    }
+
+    // 3. core_file / proc_id → always Native.
+    if params.core_file.is_some() || params.proc_id.is_some() {
+        return Ok(DebugBackendKind::Native);
+    }
+
+    // 4. ELF-based auto-detection (available only when qemu-user is compiled in).
+    #[cfg(feature = "qemu-user")]
+    if let Some(binary) = &params.binary {
+        let elf = crate::qemu::ElfInfo::from_path(binary).map_err(|e| {
+            AppError::invalid_argument(
+                "create_session.elf_detect",
+                format!("Failed to parse ELF '{}': {}", binary.display(), e),
+            )
+        })?;
+        if elf.qemu_user_binary()?.is_some() {
+            return Ok(DebugBackendKind::QemuUser);
+        }
+        // qemu_user_binary() == None → x86_64 → fall through to Native.
+    }
+
+    // 5. Default: Native.
+    Ok(DebugBackendKind::Native)
+}
+
+// ─── Tool impl block ──────────────────────────────────────────────────────────
+
 #[allow(dead_code)]
 #[tool_router_with_gef]
 impl GdbService {
     #[tool(
         name = "create_session",
-        description = "Create a new GDB debugging session with optional parameters, returns a session ID (UUID) if successful"
+        description = "Create a GDB debugging session. Automatically detects the target \
+                       architecture from the ELF binary and selects the appropriate backend \
+                       (native GDB, QEMU user-mode, or QEMU system-mode). Returns a session \
+                       ID (UUID) on success. Use the `backend` parameter to override \
+                       auto-detection."
     )]
     async fn create_session(
         &self,
         Parameters(params): Parameters<CreateSessionParams>,
     ) -> Result<String, ErrorData> {
-        let args = params
-            .args
-            .map(|args| args.into_iter().map(OsString::from).collect());
-        let program_field = params
-            .program
-            .as_ref()
-            .map(|path| path.display().to_string());
-        let gdb_path_field = params
-            .gdb_path
-            .as_ref()
-            .map(|path| path.display().to_string());
-        let create_pty_field = params.create_pty;
-        let result = GDB_MANAGER
-            .create_session(
-                params.program,
-                params.nh,
-                params.nx,
-                params.quiet,
-                params.cd,
-                params.bps,
-                params.symbol_file,
-                params.core_file,
-                params.proc_id,
-                params.command,
-                params.source_dir,
-                args,
-                params.tty,
-                params.gdb_path,
-                params.gef_script,
-                params.gef_rc,
-                params.create_pty,
-            )
-            .await;
-        let result = if let Some(program_field) = program_field {
-            result.field("program", program_field)
-        } else {
-            result
-        };
-        let result = if let Some(gdb_path_field) = gdb_path_field {
-            result.field("gdb_path", gdb_path_field)
-        } else {
-            result
-        };
-        let result = if let Some(create_pty_field) = create_pty_field {
-            result.field("create_pty", create_pty_field.to_string())
-        } else {
-            result
-        };
-        let session = result.map_err(ErrorData::from)?;
-        Ok(format!("Created GDB session: {}", session))
+        let backend = determine_backend(&params).map_err(ErrorData::from)?;
+
+        match backend {
+            DebugBackendKind::Native => {
+                if params.auto_fetch_libc == Some(true) {
+                    return Err(ErrorData::from(AppError::invalid_argument(
+                        "create_session",
+                        "auto_fetch_libc is only supported with backend = qemu-user",
+                    )));
+                }
+                let args =
+                    params.args.map(|a| a.into_iter().map(OsString::from).collect());
+                let session_id = GDB_MANAGER
+                    .create_session(
+                        params.binary,
+                        params.nh,
+                        params.nx,
+                        params.quiet,
+                        params.cd,
+                        params.bps,
+                        params.symbol_file,
+                        params.core_file,
+                        params.proc_id,
+                        params.command,
+                        params.source_dir,
+                        args,
+                        params.tty,
+                        params.gdb_path,
+                        params.gef_script,
+                        params.gef_rc,
+                        params.create_pty,
+                        params.lib_dir,
+                    )
+                    .await
+                    .map_err(ErrorData::from)?;
+                Ok(format!("Created native GDB session: {}", session_id))
+            }
+
+            #[cfg(feature = "qemu-user")]
+            DebugBackendKind::QemuUser => {
+                let binary = params.binary.ok_or_else(|| {
+                    ErrorData::from(AppError::invalid_argument(
+                        "create_session",
+                        "binary is required for qemu-user backend",
+                    ))
+                })?;
+                let binary_args =
+                    params.binary_args.map(|a| a.into_iter().map(OsString::from).collect());
+                let session_id = GDB_MANAGER
+                    .create_qemu_user_session(
+                        binary.clone(),
+                        binary_args,
+                        params.qemu_path,
+                        params.lib_dir, // lib_dir → sysroot
+                        params.auto_fetch_libc.unwrap_or(false),
+                        params.gdb_port,
+                        params.gdb_path,
+                        params.gef_script,
+                        params.gef_rc,
+                        params.symbol_file,
+                    )
+                    .await
+                    .field("binary", binary.display().to_string())
+                    .map_err(ErrorData::from)?;
+                Ok(format!("Created QEMU user-mode session: {}", session_id))
+            }
+
+            #[cfg(feature = "qemu-system")]
+            DebugBackendKind::QemuSystem => {
+                let qemu_path = params.qemu_path.ok_or_else(|| {
+                    ErrorData::from(AppError::invalid_argument(
+                        "create_session",
+                        "qemu_path is required for backend = qemu-system",
+                    ))
+                })?;
+                let gdb_port = params.gdb_port.ok_or_else(|| {
+                    ErrorData::from(AppError::invalid_argument(
+                        "create_session",
+                        "gdb_port is required for backend = qemu-system",
+                    ))
+                })?;
+                let qemu_args: Vec<OsString> = params
+                    .qemu_args
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect();
+                let session_id = GDB_MANAGER
+                    .create_qemu_system_session(
+                        qemu_path.clone(),
+                        qemu_args,
+                        gdb_port,
+                        params.gdb_path,
+                        params.gef_script,
+                        params.gef_rc,
+                        params.symbol_file,
+                    )
+                    .await
+                    .field("qemu_path", qemu_path.display().to_string())
+                    .map_err(ErrorData::from)?;
+                Ok(format!("Created QEMU system-mode session: {}", session_id))
+            }
+        }
     }
 
     #[tool(name = "get_session", description = "Get a GDB debugging session by ID")]

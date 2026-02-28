@@ -12,6 +12,17 @@ keywords = ["MCP", "tool", "AI", "LLM", "Agent"]
 categories = ["command-line-utilities"]
 default-run = "mcp-server-gdb"
 
+[features]
+default = []
+# QEMU User-mode: ELF parsing, port allocation, process management
+qemu-user = ["dep:object"]
+# QEMU System-mode: process management, target remote
+qemu-system = []
+# Both QEMU modes together
+qemu = ["qemu-user", "qemu-system"]
+# libc auto-download/extract (heavy network deps; implies qemu-user)
+libc-fetch = ["qemu-user", "dep:reqwest", "dep:ar", "dep:tar", "dep:xz2", "dep:flate2", "dep:zstd", "dep:tempfile"]
+
 [dependencies]
 tokio = { version = "1.44", features = ["full"] }
 tracing = "0.1"
@@ -26,7 +37,7 @@ anyhow = "1.0"
 uuid = { version = "1.7", features = ["v4", "serde"] }
 clap = { version = "4.5",  features = ["derive"] }
 dotenv = "0.15"
-rmcp = { version = "0.14.0", features = [
+rmcp = { version = "0.16.0", features = [
   "client",
   "server",
   "transport-io",
@@ -36,6 +47,15 @@ rmcp = { version = "0.14.0", features = [
 ] }
 mcp-server-gdb-macros = { path = "crates/mcp_server_gdb_macros" }
 nom = "8.0"
+# Optional: QEMU feature dependencies
+object   = { version = "0.38.1", features = ["read"], optional = true }
+reqwest  = { version = "0.12", features = ["rustls-tls"], default-features = false, optional = true }
+ar       = { version = "0.9",  optional = true }
+tar      = { version = "0.4",  optional = true }
+xz2      = { version = "0.1",  optional = true }
+flate2   = { version = "1.0",  optional = true }
+zstd     = { version = "0.13", optional = true }
+tempfile = { version = "3",    optional = true }
 crossterm = { version = "0.29", features = ["event-stream"] }
 ratatui = "0.30"
 axum = "0.8"
@@ -57,6 +77,9 @@ path = "src/bin/gdb_client.rs"
 [[bin]]
 name = "test_app"
 path = "src/bin/test_app.rs"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 strip = "debuginfo"
