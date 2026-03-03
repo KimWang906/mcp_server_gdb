@@ -1,5 +1,44 @@
 # Codex MCP Integration Agent
 
+## GDB MCP Server 디버깅
+
+바이너리 디버깅, CTF 분석, 메모리/레지스터 검사, 크래시 분석 시 `mcp-server-gdb` MCP 도구를 사용한다.
+
+**기본 흐름:**
+```
+create_session → start_debugging → (검사/제어 루프) → close_session
+```
+
+**세션 상태별 사용 가능 도구:**
+- Created: `set_breakpoint`, `execute_cli` (set 명령만)
+- Running: `stop_debugging`
+- Stopped: 모든 검사 도구 (`get_registers`, `read_memory`, `vmmap` 등), `continue/step/next_execution`
+- Terminated: `close_session`만
+
+**백엔드 자동 선택:**
+- x86_64 ELF → Native GDB (`exec-run`)
+- ARM/MIPS/RISC-V/PPC ELF → QEMU user-mode 자동 감지 (`--features qemu-user` 필요, `exec-continue`)
+- `core_file=<path>` → Native (코어 덤프 분석)
+- `proc_id=<pid>` → Native (프로세스 연결)
+- `backend="qemu-system"` + `qemu_args=[…,-S,-gdb,tcp::<port>]` → QEMU system-mode
+
+**주요 도구:**
+- 보안 속성: `checksec`, `canary`, `aslr`, `pie`
+- 메모리 레이아웃: `vmmap`, `hexdump`, `read_memory`, `dereference`
+- GOT/힙: `got`, `heap`, `heap-analysis-helper`, `elf-info`
+- 패턴/검색: `pattern`, `search-pattern`
+- 임의 GDB 명령: `execute_cli(json=true)` → gef-json 구조화 출력
+- 패치 ⚠️: `nop`, `patch`, `stub` (메모리만 수정, 디스크 불변)
+
+**PTY 제약:** `get_inferior_output` / `send_inferior_input`은 QEMU 세션 불가.
+Native + `create_pty=true` 조합만 지원.
+
+**모든 도구에 `session_id` 파라미터 필수** (create_session 반환값).
+
+전체 도구 레퍼런스: `.claude/skills/gdb-mcp/tool-reference.md`
+
+---
+
 이 문서는 Codex MCP 환경에서 이 저장소를 작업하기 위한 통합 지침입니다.
 
 **Project Context**

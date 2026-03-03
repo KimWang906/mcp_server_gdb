@@ -1,0 +1,86 @@
+---
+description: GDB MCP Server debugging rules and tool guide
+globs: ["**/*.c", "**/*.cpp", "**/*.h", "**/*.rs", "**/*.py", "**/*.s", "**/*.asm", "Makefile", "CMakeLists.txt"]
+alwaysApply: false
+---
+
+# GDB MCP Server — Cursor Rules
+
+Use the `mcp-server-gdb` MCP tools when debugging binaries, analyzing CTF
+challenges, or inspecting memory. All tools require a `session_id` UUID.
+
+## Session Lifecycle
+
+```
+create_session → start_debugging → [inspect/control loop] → close_session
+```
+
+State rules:
+- **Created**: `set_breakpoint`, `execute_cli` (set commands only)
+- **Running**: `stop_debugging`
+- **Stopped**: all inspect/patch tools, `continue/step/next_execution`
+- **Terminated**: `close_session` only
+
+## Backend Auto-Selection
+
+| Binary Type | Parameters | Backend Chosen |
+|-------------|-----------|----------------|
+| x86_64 ELF | `binary=<path>` | Native GDB |
+| ARM/MIPS/RISC-V/PPC ELF | `binary=<path>` | QEMU user-mode (auto-detect) |
+| Core dump | `core_file=<path>`, `binary=<path>` | Native |
+| Process attach | `proc_id=<pid>` | Native |
+| QEMU kernel/firmware | `backend="qemu-system"`, `qemu_args=[…]`, `gdb_port=N` | QEMU system |
+
+QEMU auto-detection requires server built with `--features qemu-user`.
+
+`start_debugging` behavior:
+- Native: `exec-run` (starts fresh)
+- QEMU / core dump / attach: `exec-continue` (already halted)
+
+## PTY Constraint
+
+`get_inferior_output` / `send_inferior_input`: **native sessions only**
+with `create_pty=true`. Returns error for QEMU sessions.
+
+## Intent → Tool
+
+| Goal | Tool |
+|------|------|
+| Security check | `checksec` |
+| Memory layout | `vmmap` |
+| GOT analysis | `got` |
+| Heap inspection | `heap`, `heap-analysis-helper` |
+| Registers (structured) | `get_registers` |
+| Registers (visual) | `registers` |
+| Read raw bytes | `read_memory` |
+| Hexdump | `hexdump` |
+| Pattern / ROP | `pattern`, `search-pattern` |
+| Arbitrary GDB command | `execute_cli` |
+| Patch instructions | `nop`, `patch` ⚠️ |
+| Crash trace | `get_stack_frames` + `get_local_variables` |
+
+## JSON Output
+
+Add `json=true` to GEF tools and `execute_cli` for machine-parseable output.
+`execute_cli(json=true)` auto-prepends `gef-json` prefix.
+
+## Destructive Tools (use with care)
+
+`patch`, `nop`, `stub`, `xor-memory`, `edit-flags` — modify in-memory state only;
+disk binary is unchanged.
+
+## Quick Start
+
+```
+1. create_session(binary="./target")
+2. set_breakpoint(session_id=<id>, file="main.c", line=10)
+3. start_debugging(session_id=<id>)
+4. checksec(session_id=<id>, json=true)
+5. get_registers(session_id=<id>)
+6. close_session(session_id=<id>)
+```
+
+## Full Reference
+
+See `.claude/skills/gdb-mcp/tool-reference.md` for the complete 67-tool catalog
+with required state, parameters, and safety notes.
