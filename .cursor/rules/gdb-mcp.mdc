@@ -1,10 +1,18 @@
 ---
 description: GDB MCP Server debugging rules and tool guide
-globs: ["**/*.c", "**/*.cpp", "**/*.h", "**/*.rs", "**/*.py", "**/*.s", "**/*.asm", "Makefile", "CMakeLists.txt"]
-alwaysApply: false
+alwaysApply: true
 ---
 
 # GDB MCP Server — Cursor Rules
+
+## MANDATORY: Always Use MCP Tools
+
+**NEVER run `gdb`, `gdb-multiarch`, or `qemu-*` directly via shell/terminal.**
+**ALWAYS use `mcp-server-gdb` MCP tools for all debugging tasks.**
+
+Rationale: Direct gdb execution corrupts the MCP JSON-RPC stream and bypasses
+session state tracking. If the MCP server is not running, report that to the
+user instead of falling back to shell gdb.
 
 Use the `mcp-server-gdb` MCP tools when debugging binaries, analyzing CTF
 challenges, or inspecting memory. All tools require a `session_id` UUID.
@@ -37,10 +45,14 @@ QEMU auto-detection requires server built with `--features qemu-user`.
 - Native: `exec-run` (starts fresh)
 - QEMU / core dump / attach: `exec-continue` (already halted)
 
-## PTY Constraint
+## Inferior I/O
 
-`get_inferior_output` / `send_inferior_input`: **native sessions only**
-with `create_pty=true`. Returns error for QEMU sessions.
+`get_inferior_output`:
+- Native: requires `create_pty=true` in `create_session`
+- QEMU user-mode: always available (stdout piped automatically)
+- QEMU system-mode: not available
+
+`send_inferior_input`: native sessions with `create_pty=true` only.
 
 ## Intent → Tool
 
