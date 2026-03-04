@@ -99,6 +99,16 @@ struct GDBSessionHandle {
     /// Stored as `Box<dyn Any + Send>` to avoid exposing `tempfile` types here.
     #[cfg(feature = "libc-fetch")]
     _libc_work_dir: Option<Box<dyn std::any::Any + Send>>,
+    /// Keeps the QEMU system serial socket TempDir alive for the session lifetime.
+    /// Stored as `Box<dyn Any + Send>` to avoid exposing `tempfile` types here.
+    #[cfg(feature = "qemu-system")]
+    _serial_work_dir: Option<Box<dyn std::any::Any + Send>>,
+    /// Write half of the QEMU serial Unix socket (system-mode `send_inferior_input`).
+    #[cfg(feature = "qemu-system")]
+    serial_writer: Option<Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>>,
+    /// Stdin pipe for the QEMU user-mode child process (`send_inferior_input`).
+    #[cfg(feature = "qemu-user")]
+    qemu_user_stdin: Option<Arc<Mutex<tokio::process::ChildStdin>>>,
 }
 
 impl GDBManager {
@@ -324,6 +334,12 @@ impl GDBManager {
             qemu_monitor: None,
             #[cfg(feature = "libc-fetch")]
             _libc_work_dir: None,
+            #[cfg(feature = "qemu-system")]
+            _serial_work_dir: None,
+            #[cfg(feature = "qemu-system")]
+            serial_writer: None,
+            #[cfg(feature = "qemu-user")]
+            qemu_user_stdin: None,
         };
 
         self.sessions.lock().await.insert(session_id.clone(), handle);
@@ -517,6 +533,12 @@ impl GDBManager {
             spawn_qemu_user(&qemu_bin, port, &binary, &binary_args, resolved_sysroot.as_deref())
                 .await?;
 
+        // Take stdin pipe before moving `raw_child` into Arc<Mutex<>>.
+        let qemu_user_stdin = raw_child
+            .stdin
+            .take()
+            .map(|s| Arc::new(Mutex::new(s)));
+
         // Drain QEMU stderr into a rolling buffer for diagnostics.
         let stderr_lines = Arc::new(Mutex::new(Vec::<String>::new()));
         if let Some(stderr) = raw_child.stderr.take() {
@@ -539,6 +561,25 @@ impl GDBManager {
                 }
             });
         }
+
+        // Drain QEMU stdout (emulated binary output) into inferior_output buffer.
+        let inferior_output_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stdout_drain_handle = if let Some(stdout) = raw_child.stdout.take() {
+            let buf_clone = inferior_output_buf.clone();
+            Some(tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut reader = TokioBufReader::new(stdout);
+                let mut chunk = vec![0u8; 4096];
+                loop {
+                    match reader.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf_clone.lock().await.extend_from_slice(&chunk[..n]),
+                    }
+                }
+            }))
+        } else {
+            None
+        };
 
         // Wait for the GDB stub to open its port (timeout: 3 s).
         wait_for_tcp_ready(&mut raw_child, port, Duration::from_secs(3)).await?;
@@ -657,13 +698,18 @@ impl GDBManager {
             stderr_handle,
             stream_buffer,
             pty_pair: None,
-            pty_read_handle: None,
+            pty_read_handle: stdout_drain_handle,
             pty_writer: None,
-            inferior_output: None,
+            inferior_output: Some(inferior_output_buf),
             qemu: Some(qemu_process),
             qemu_monitor: None, // filled in below after insert
             #[cfg(feature = "libc-fetch")]
             _libc_work_dir: _libc_work_dir_holder,
+            #[cfg(feature = "qemu-system")]
+            _serial_work_dir: None,
+            #[cfg(feature = "qemu-system")]
+            serial_writer: None,
+            qemu_user_stdin,
         };
 
         self.sessions.lock().await.insert(session_id.clone(), handle);
@@ -765,12 +811,56 @@ impl GDBManager {
         gef_rc: Option<PathBuf>,
         symbol_file: Option<PathBuf>,
     ) -> AppResult<String> {
-        use crate::qemu::{QemuProcess, spawn_qemu_monitor, spawn_qemu_system, wait_for_tcp_ready};
+        use crate::qemu::{
+            QemuProcess, connect_unix_serial, spawn_qemu_monitor, spawn_qemu_system,
+            wait_for_tcp_ready,
+        };
 
         let session_id = Uuid::new_v4().to_string();
 
+        // ── Serial socket injection ───────────────────────────────────────────
+        // If the user hasn't already passed `-serial`, inject a Unix socket
+        // chardev so we can capture VM console output in `inferior_output`.
+        let user_has_serial = qemu_args
+            .iter()
+            .any(|a| a.to_string_lossy() == "-serial");
+
+        let mut _serial_work_dir_holder: Option<Box<dyn std::any::Any + Send>> = None;
+        let serial_sock_path: Option<PathBuf>;
+        let extra_args: Vec<OsString>;
+
+        if user_has_serial {
+            serial_sock_path = None;
+            extra_args = vec![];
+        } else {
+            let work_dir = tempfile::TempDir::new().map_err(|e| {
+                AppError::backend(
+                    "qemu.create_system_session",
+                    format!("Failed to create serial socket dir: {}", e),
+                )
+            })?;
+            let sock = work_dir.path().join("serial.sock");
+            let path_str = sock.to_string_lossy();
+            if path_str.contains(',') {
+                return Err(AppError::backend(
+                    "qemu.create_system_session",
+                    "serial socket path contains comma — invalid in QEMU chardev syntax",
+                ));
+            }
+            extra_args = vec![
+                OsString::from("-chardev"),
+                OsString::from(format!(
+                    "socket,id=mcp_serial,path={path_str},server=on,wait=off"
+                )),
+                OsString::from("-serial"),
+                OsString::from("chardev:mcp_serial"),
+            ];
+            serial_sock_path = Some(sock);
+            _serial_work_dir_holder = Some(Box::new(work_dir));
+        }
+
         // ── Spawn QEMU system VM ──────────────────────────────────────────────
-        let mut raw_child = spawn_qemu_system(&qemu_path, &qemu_args).await?;
+        let mut raw_child = spawn_qemu_system(&qemu_path, &qemu_args, &extra_args).await?;
 
         // Drain QEMU stderr.
         let stderr_lines = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -797,6 +887,39 @@ impl GDBManager {
 
         // System mode can take longer to start; allow 10 s.
         wait_for_tcp_ready(&mut raw_child, gdb_port, Duration::from_secs(10)).await?;
+
+        // ── Serial socket drain ───────────────────────────────────────────────
+        let inferior_output_buf: Option<Arc<Mutex<Vec<u8>>>>;
+        let serial_drain_handle: Option<JoinHandle<()>>;
+        let serial_writer_half: Option<Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>>;
+
+        if let Some(ref sock_path) = serial_sock_path {
+            let stream =
+                connect_unix_serial(&mut raw_child, sock_path, Duration::from_secs(2)).await?;
+            let (read_half, write_half) = stream.into_split();
+
+            let output_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let buf_clone = output_buf.clone();
+            let drain = tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut reader = TokioBufReader::new(read_half);
+                let mut chunk = vec![0u8; 4096];
+                loop {
+                    match reader.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf_clone.lock().await.extend_from_slice(&chunk[..n]),
+                    }
+                }
+            });
+
+            inferior_output_buf = Some(output_buf);
+            serial_drain_handle = Some(drain);
+            serial_writer_half = Some(Arc::new(Mutex::new(write_half)));
+        } else {
+            inferior_output_buf = None;
+            serial_drain_handle = None;
+            serial_writer_half = None;
+        }
 
         let child_arc = Arc::new(Mutex::new(raw_child));
         let qemu_process = QemuProcess {
@@ -899,13 +1022,17 @@ impl GDBManager {
             stderr_handle,
             stream_buffer,
             pty_pair: None,
-            pty_read_handle: None,
+            pty_read_handle: serial_drain_handle,
             pty_writer: None,
-            inferior_output: None,
+            inferior_output: inferior_output_buf,
             qemu: Some(qemu_process),
             qemu_monitor: None,
             #[cfg(feature = "libc-fetch")]
             _libc_work_dir: None,
+            _serial_work_dir: _serial_work_dir_holder,
+            serial_writer: serial_writer_half,
+            #[cfg(feature = "qemu-user")]
+            qemu_user_stdin: None,
         };
 
         self.sessions.lock().await.insert(session_id.clone(), handle);
@@ -1438,16 +1565,11 @@ impl GDBManager {
                     format!("Session {} does not exist", session_id),
                 )
             })?;
-        // QEMU sessions do not use PTY for inferior I/O.
-        #[cfg(any(feature = "qemu-user", feature = "qemu-system"))]
-        if handle.qemu.is_some() {
-            return Err(AppError::invalid_argument(
-                "gdb.get_inferior_output",
-                "QEMU sessions do not support PTY-based inferior I/O",
-            ));
-        }
         let output = handle.inferior_output.as_ref().ok_or_else(|| {
-            AppError::invalid_argument("gdb.get_inferior_output", "PTY is not enabled for this session")
+            AppError::invalid_argument(
+                "gdb.get_inferior_output",
+                "inferior output capture is not available for this session",
+            )
         })?;
         let mut buffer = output.lock().await;
         if buffer.is_empty() {
@@ -1469,12 +1591,44 @@ impl GDBManager {
                 )
             })?;
         // QEMU sessions do not use PTY for inferior I/O.
-        #[cfg(any(feature = "qemu-user", feature = "qemu-system"))]
-        if handle.qemu.is_some() {
-            return Err(AppError::invalid_argument(
-                "gdb.send_inferior_input",
-                "QEMU sessions do not support PTY-based inferior I/O",
-            ));
+        // System-mode: route input to the serial Unix socket.
+        #[cfg(feature = "qemu-system")]
+        if handle.info.backend == DebugBackendKind::QemuSystem {
+            use tokio::io::AsyncWriteExt;
+            let writer_arc = handle.serial_writer.as_ref().ok_or_else(|| {
+                AppError::invalid_argument(
+                    "gdb.send_inferior_input",
+                    "QEMU system-mode serial I/O not available \
+                     (user passed -serial in qemu_args)",
+                )
+            })?;
+            let mut w = writer_arc.lock().await;
+            w.write_all(input.as_bytes())
+                .await
+                .context("gdb.send_inferior_input", "write serial socket")?;
+            w.flush()
+                .await
+                .context("gdb.send_inferior_input", "flush serial socket")?;
+            return Ok(());
+        }
+        // User-mode: forward input to the piped stdin of the QEMU child.
+        #[cfg(feature = "qemu-user")]
+        if handle.info.backend == DebugBackendKind::QemuUser {
+            use tokio::io::AsyncWriteExt;
+            let stdin_arc = handle.qemu_user_stdin.as_ref().ok_or_else(|| {
+                AppError::invalid_argument(
+                    "gdb.send_inferior_input",
+                    "QEMU user-mode stdin pipe is not available",
+                )
+            })?;
+            let mut w = stdin_arc.lock().await;
+            w.write_all(input.as_bytes())
+                .await
+                .context("gdb.send_inferior_input", "write QEMU user-mode stdin")?;
+            w.flush()
+                .await
+                .context("gdb.send_inferior_input", "flush QEMU user-mode stdin")?;
+            return Ok(());
         }
         let writer = handle.pty_writer.as_mut().ok_or_else(|| {
             AppError::invalid_argument("gdb.send_inferior_input", "PTY is not enabled for this session")

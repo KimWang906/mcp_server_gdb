@@ -258,6 +258,11 @@ pub async fn spawn_qemu_user(
     cmd.arg("-g").arg(port.to_string());
     cmd.arg(binary);
     cmd.args(binary_args);
+    // Pipe stdin so `send_inferior_input` can write to the emulated binary.
+    cmd.stdin(std::process::Stdio::piped());
+    // Pipe stdout so the emulated binary's output does not leak into the MCP
+    // server's JSON-RPC stdout.  The caller drains it into `inferior_output`.
+    cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
     cmd.spawn().map_err(|e| {
@@ -271,14 +276,18 @@ pub async fn spawn_qemu_user(
 /// Spawn a QEMU system-mode VM.
 ///
 /// The caller is responsible for passing `-S -gdb tcp::<port>` in `qemu_args`.
+/// `extra_args` is appended after `qemu_args` (used to inject chardev/serial args).
 /// Returns the raw `Child`.
 #[cfg(feature = "qemu-system")]
 pub async fn spawn_qemu_system(
     qemu_path: &Path,
     qemu_args: &[OsString],
+    extra_args: &[OsString],
 ) -> AppResult<tokio::process::Child> {
     let mut cmd = tokio::process::Command::new(qemu_path);
     cmd.args(qemu_args);
+    cmd.args(extra_args);
+    cmd.stdout(std::process::Stdio::null()); // prevent VM console from polluting MCP JSON-RPC stdout
     cmd.stderr(std::process::Stdio::piped());
 
     cmd.spawn().map_err(|e| {
@@ -287,6 +296,49 @@ pub async fn spawn_qemu_system(
             format!("Failed to spawn '{}': {}", qemu_path.display(), e),
         )
     })
+}
+
+/// Poll until the QEMU serial Unix socket is connectable, or the deadline passes.
+///
+/// Mirrors `wait_for_tcp_ready` — detects early child exit so callers get a
+/// meaningful error rather than a bare timeout.
+#[cfg(feature = "qemu-system")]
+pub async fn connect_unix_serial(
+    child: &mut tokio::process::Child,
+    sock_path: &std::path::Path,
+    timeout: Duration,
+) -> AppResult<tokio::net::UnixStream> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(AppError::backend(
+                    "qemu.serial_connect",
+                    format!("QEMU exited (status {:?}) before serial socket was ready", status),
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(AppError::backend(
+                    "qemu.serial_connect",
+                    format!("QEMU wait error: {}", e),
+                ));
+            }
+        }
+
+        if let Ok(stream) = tokio::net::UnixStream::connect(sock_path).await {
+            return Ok(stream);
+        }
+
+        if Instant::now() >= deadline {
+            return Err(AppError::timeout(
+                "qemu.serial_connect",
+                format!("serial socket {:?} not ready within {:?}", sock_path, timeout),
+            ));
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Spawn a background task that polls the QEMU child every 500 ms

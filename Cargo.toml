@@ -16,8 +16,8 @@ default-run = "mcp-server-gdb"
 default = []
 # QEMU User-mode: ELF parsing, port allocation, process management
 qemu-user = ["dep:object"]
-# QEMU System-mode: process management, target remote
-qemu-system = []
+# QEMU System-mode: process management, target remote, serial socket capture
+qemu-system = ["dep:tempfile"]
 # Both QEMU modes together
 qemu = ["qemu-user", "qemu-system"]
 # libc auto-download/extract (heavy network deps; implies qemu-user)
