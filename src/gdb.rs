@@ -1267,81 +1267,113 @@ impl GDBManager {
     }
 
     async fn ensure_stopped(&self, session_id: &str, timeout: Duration) -> AppResult<()> {
-        let is_running = {
-            let gdb = {
-                let sessions = self.sessions.lock().await;
-                sessions
-                    .get(session_id)
-                    .ok_or_else(|| {
-                        AppError::not_found(
-                            "gdb.ensure_stopped",
-                            format!("Session {} does not exist", session_id),
-                        )
-                })?
-                    .gdb
-                    .clone()
-            };
-            let gdb = gdb.lock().await;
-            gdb.is_running()
-        };
-
-        if !is_running {
-            return Ok(());
-        }
-
-        let gdb = {
+        let (gdb_handle, backend) = {
             let sessions = self.sessions.lock().await;
-            sessions
+            let handle = sessions
                 .get(session_id)
                 .ok_or_else(|| {
                     AppError::not_found(
                         "gdb.ensure_stopped",
                         format!("Session {} does not exist", session_id),
                     )
-                })?
-                .gdb
-                .clone()
+                })?;
+            (handle.gdb.clone(), handle.info.backend.clone())
         };
-        let gdb = gdb.lock().await;
-        gdb.interrupt_execution()
-            .await
-            .map_err(|e| {
-                AppError::backend("gdb.ensure_stopped", format!("interrupt failed: {}", e))
-            })?;
 
-        let start = Instant::now();
-        loop {
-            let is_running = {
-                let gdb = {
-                    let sessions = self.sessions.lock().await;
-                    sessions
-                        .get(session_id)
-                        .ok_or_else(|| {
-                            AppError::not_found(
+        let is_running = {
+            let gdb = gdb_handle.lock().await;
+            gdb.is_running()
+        };
+
+        debug!(
+            session_id = %session_id,
+            backend = ?backend,
+            is_running,
+            timeout_ms = timeout.as_millis(),
+            "ensure_stopped start"
+        );
+
+        if !is_running {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(handle) = sessions.get_mut(session_id) {
+                handle.info.status = GDBSessionStatus::Stopped;
+            }
+            return Ok(());
+        }
+
+        let mut gdb = gdb_handle.lock().await;
+        let interrupt_error = {
+            #[cfg(feature = "qemu-system")]
+            if backend == DebugBackendKind::QemuSystem {
+                let result = gdb.interrupt_execution_mi().await;
+                match result {
+                    Ok(()) => {
+                        debug!(
+                            session_id = %session_id,
+                            "ensure_stopped: exec-interrupt sent for qemu-system"
+                        );
+                        Ok(())
+                    }
+                    Err(mi_err) => {
+                        warn!(
+                            session_id = %session_id,
+                            error = %mi_err,
+                            "ensure_stopped: exec-interrupt failed, fallback ctrl-c"
+                        );
+                        gdb.interrupt_execution_ctrl_c().await.map_err(|ctrl_err| {
+                            AppError::backend(
                                 "gdb.ensure_stopped",
-                                format!("Session {} does not exist", session_id),
+                                format!(
+                                    "interrupt failed: exec-interrupt={}; ctrl-c={}",
+                                    mi_err, ctrl_err
+                                ),
                             )
-                        })?
-                        .gdb
-                        .clone()
-                };
-                let gdb = gdb.lock().await;
-                gdb.is_running()
-            };
-            if !is_running {
-                let mut sessions = self.sessions.lock().await;
-                if let Some(handle) = sessions.get_mut(session_id) {
-                    handle.info.status = GDBSessionStatus::Stopped;
+                        })
+                    }
                 }
-                return Ok(());
+            } else {
+                gdb.interrupt_execution()
+                    .await
+                    .map_err(|e| {
+                        AppError::backend(
+                            "gdb.ensure_stopped",
+                            format!("interrupt failed: {}", e),
+                        )
+                    })
             }
-            if start.elapsed() >= timeout {
-                return Err(AppError::timeout(
-                    "gdb.ensure_stopped",
-                    "Timeout waiting for GDB to stop",
-                ));
+            #[cfg(not(feature = "qemu-system"))]
+            gdb.interrupt_execution().await.map_err(|e| {
+                AppError::backend("gdb.ensure_stopped", format!("interrupt failed: {}", e))
+            })
+        };
+        drop(gdb);
+        if let Err(e) = interrupt_error {
+            return Err(e);
+        }
+
+        let status_update = async {
+            loop {
+                let is_running = {
+                    let gdb = gdb_handle.lock().await;
+                    gdb.is_running()
+                };
+                if !is_running {
+                    let mut sessions = self.sessions.lock().await;
+                    if let Some(handle) = sessions.get_mut(session_id) {
+                        handle.info.status = GDBSessionStatus::Stopped;
+                    }
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        match tokio::time::timeout(timeout, status_update).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(AppError::timeout(
+                "gdb.ensure_stopped",
+                "Timeout waiting for GDB to stop",
+            )),
         }
     }
 
@@ -1444,6 +1476,27 @@ impl GDBManager {
     /// Stop debugging
     pub async fn stop_debugging(&self, session_id: &str) -> AppResult<String> {
         let timeout = Duration::from_secs(self.config.command_timeout);
+        let (backend, gdb_handle) = {
+            let sessions = self.sessions.lock().await;
+            let handle = sessions.get(session_id).ok_or_else(|| {
+                AppError::not_found(
+                    "gdb.stop_debugging",
+                    format!("Session {} does not exist", session_id),
+                )
+            })?;
+            (handle.info.backend.clone(), handle.gdb.clone())
+        };
+        let is_running = {
+            let gdb = gdb_handle.lock().await;
+            gdb.is_running()
+        };
+        debug!(
+            session_id = %session_id,
+            backend = ?backend,
+            is_running,
+            timeout_ms = timeout.as_millis(),
+            "stop_debugging called"
+        );
         self.ensure_stopped(session_id, timeout).await?;
         Ok("stopped".to_string())
     }

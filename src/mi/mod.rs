@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::Result;
 use output::process_output;
-use tokio::io::BufReader;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{self, Sender};
@@ -232,6 +232,45 @@ pub async fn interrupt_execution(&self) -> Result<(), nix::Error> {
         .ok_or_else(|| nix::Error::from(Errno::ESRCH))?;
     signal::kill(Pid::from_raw(pid as i32), signal::SIGINT)
 }
+
+    pub async fn interrupt_execution_mi(&mut self) -> AppResult<()> {
+        let token = self.new_token();
+        let command = commands::MiCommand::exec_interrupt();
+        let mut gdb = self.process.lock().await;
+        command
+            .write_interpreter_string(
+                gdb.stdin
+                    .as_mut()
+                    .ok_or_else(|| AppError::backend("mi.interrupt_execution_mi", "Failed to get stdin"))?,
+                token,
+            )
+            .await
+            .context("mi.interrupt_execution_mi", "write exec-interrupt command")?;
+        gdb.stdin
+            .as_mut()
+            .ok_or_else(|| {
+                AppError::backend(
+                    "mi.interrupt_execution_mi",
+                    "Failed to get stdin for exec-interrupt flush",
+                )
+            })?
+            .flush()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn interrupt_execution_ctrl_c(&mut self) -> AppResult<()> {
+        let mut gdb = self.process.lock().await;
+        let stdin = gdb.stdin.as_mut().ok_or_else(|| {
+            AppError::backend(
+                "mi.interrupt_execution_ctrl_c",
+                "Failed to get stdin for ctrl-c interrupt",
+            )
+        })?;
+        stdin.write_all(b"\x03").await?;
+        stdin.flush().await?;
+        Ok(())
+    }
 
     #[cfg(windows)]
     #[allow(dead_code)]
