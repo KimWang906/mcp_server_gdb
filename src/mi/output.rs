@@ -137,7 +137,10 @@ pub async fn process_output<T: AsyncRead + Unpin>(
                             ResultClass::Error => is_running.store(false, Ordering::SeqCst),
                             _ => {}
                         }
-                        result_pipe.send(record).await.expect("send result to pipe");
+                        if result_pipe.send(record).await.is_err() {
+                            // Receiver dropped (session closed) — exit cleanly.
+                            break;
+                        }
                     }
                     Output::OutOfBand(record) => {
                         if let OutOfBandRecord::AsyncRecord { class: AsyncClass::Stopped, .. } =
@@ -145,26 +148,25 @@ pub async fn process_output<T: AsyncRead + Unpin>(
                         {
                             is_running.store(false, Ordering::SeqCst);
                         }
-                        out_of_band_pipe
-                            .send(record)
-                            .await
-                            .expect("send out of band record to pipe");
+                        // try_send so a full OOB pipe never stalls this loop and
+                        // prevents result records from being forwarded.
+                        if out_of_band_pipe.try_send(record).is_err() {
+                            debug!("process_output: OOB pipe full or closed, dropping record");
+                        }
                     }
                     Output::GDBLine => {}
-                    //Output::SomethingElse(_) => { /*println!("SOMETHING ELSE: {}", str);*/ }
                     Output::SomethingElse(text) => {
-                        out_of_band_pipe
-                            .send(OutOfBandRecord::StreamRecord {
-                                kind: StreamKind::Target,
-                                data: text,
-                            })
-                            .await
-                            .expect("send out of band record to pipe");
+                        let _ = out_of_band_pipe.try_send(OutOfBandRecord::StreamRecord {
+                            kind: StreamKind::Target,
+                            data: text,
+                        });
                     }
                 }
             }
             Err(e) => {
-                panic!("{}", e);
+                // I/O error on GDB stdout — log and exit cleanly rather than panic.
+                error!("process_output: read error: {}", e);
+                break;
             }
         }
     }

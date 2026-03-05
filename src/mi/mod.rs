@@ -198,7 +198,8 @@ impl GDBBuilder {
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let is_running = Arc::new(AtomicBool::new(false));
         let is_running_clone = is_running.clone();
-        let (result_input, result_output) = mpsc::channel(100);
+        // Large buffer so rapid result records don't block process_output.
+        let (result_input, result_output) = mpsc::channel(256);
         tokio::spawn(process_output(stdout, result_input, oob_sink, is_running_clone));
 
         let gdb = GDB {
@@ -317,6 +318,15 @@ impl GDB {
                         self.pending_results.push_back(record);
                     }
                     None if !expects_token => return Ok(record),
+                    // QEMU GDB stubs sometimes send ^running without a token.
+                    // Accept it so exec-continue doesn't time out waiting.
+                    None if record.class == output::ResultClass::Running => {
+                        debug!(
+                            "mi.execute: accepting tokenless ^running (expecting token {})",
+                            command_token
+                        );
+                        return Ok(record);
+                    }
                     None => {
                         debug!(
                             "mi.execute: dropping tokenless result (expecting {})",

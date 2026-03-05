@@ -249,7 +249,7 @@ impl GDBManager {
             opt_create_pty: create_pty,
         };
 
-        let (oob_src, mut oob_sink) = mpsc::channel(100);
+        let (oob_src, mut oob_sink) = mpsc::channel(2048);
         let gdb = gdb_builder
             .try_spawn(oob_src)
             .context("gdb.create_session", "spawn GDB process")?;
@@ -626,7 +626,7 @@ impl GDBManager {
             opt_create_pty: false,
         };
 
-        let (oob_src, mut oob_sink) = mpsc::channel(100);
+        let (oob_src, mut oob_sink) = mpsc::channel(2048);
         let gdb = gdb_builder
             .try_spawn(oob_src)
             .context("qemu.create_user_session", "spawn GDB process")?;
@@ -958,7 +958,7 @@ impl GDBManager {
             opt_create_pty: false,
         };
 
-        let (oob_src, mut oob_sink) = mpsc::channel(100);
+        let (oob_src, mut oob_sink) = mpsc::channel(2048);
         let gdb = gdb_builder
             .try_spawn(oob_src)
             .context("qemu.create_system_session", "spawn GDB process")?;
@@ -1206,7 +1206,36 @@ impl GDBManager {
             LaunchMode::ExecContinue => MiCommand::exec_continue(),
         };
 
-        let response = self.send_command_with_timeout(session_id, &cmd).await?;
+        // For ExecContinue (QEMU/remote), a timeout or a "GDB is busy" response
+        // just means the kernel is already running — treat it as success.
+        // Only hard errors (explicit ^error from GDB, session not found, …) propagate.
+        let result_str = match launch_mode {
+            LaunchMode::ExecRun => {
+                let response = self.send_command_with_timeout(session_id, &cmd).await?;
+                response.results.to_string()
+            }
+            LaunchMode::ExecContinue => {
+                match self.send_command_with_timeout(session_id, &cmd).await {
+                    Ok(response) => response.results.to_string(),
+                    Err(ref e)
+                        if matches!(
+                            e.kind,
+                            crate::error::ErrorKind::Timeout | crate::error::ErrorKind::Busy
+                        ) =>
+                    {
+                        // Kernel is already running or GDB stub did not echo ^running.
+                        warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "exec-continue did not receive ^running; \
+                             assuming kernel is running"
+                        );
+                        "running".to_string()
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        };
 
         // Update session status
         let mut sessions = self.sessions.lock().await;
@@ -1214,7 +1243,7 @@ impl GDBManager {
             handle.info.status = GDBSessionStatus::Running;
         }
 
-        Ok(response.results.to_string())
+        Ok(result_str)
     }
 
     /// Stop debugging
