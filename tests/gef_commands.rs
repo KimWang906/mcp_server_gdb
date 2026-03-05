@@ -33,6 +33,7 @@ async fn test_gef_command_vmmap() -> Result<(), Box<dyn std::error::Error>> {
             Some(PathBuf::from("vendor/gef/gef.py")),
             Some(PathBuf::from("configs/gef.rc")),
             Some(true),
+            None,
         )
         .await?;
 

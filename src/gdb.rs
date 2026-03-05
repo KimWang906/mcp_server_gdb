@@ -23,6 +23,8 @@ use crate::models::{
     StackFrame, Variable,
 };
 
+const MAX_STREAM_BUFFER_LINES: usize = 10_000;
+
 fn normalize_mi_list(value: serde_json::Value, inner_key: &str) -> serde_json::Value {
     match value {
         serde_json::Value::Array(items) => {
@@ -59,6 +61,13 @@ fn normalize_mi_list(value: serde_json::Value, inner_key: &str) -> serde_json::V
     }
 }
 
+fn push_stream_buffer_line(buffer: &mut Vec<String>, line: String) {
+    if buffer.len() >= MAX_STREAM_BUFFER_LINES {
+        let _ = buffer.remove(0);
+    }
+    buffer.push(line);
+}
+
 /// GDB Session Manager
 #[derive(Default)]
 pub struct GDBManager {
@@ -73,7 +82,7 @@ struct GDBSessionHandle {
     /// Session information
     info: GDBSession,
     /// GDB instance
-    gdb: GDB,
+    gdb: Arc<Mutex<GDB>>,
     /// OOB handle
     oob_handle: JoinHandle<()>,
     /// Stderr reader handle
@@ -250,9 +259,11 @@ impl GDBManager {
         };
 
         let (oob_src, mut oob_sink) = mpsc::channel(2048);
-        let gdb = gdb_builder
-            .try_spawn(oob_src)
-            .context("gdb.create_session", "spawn GDB process")?;
+        let gdb = Arc::new(Mutex::new(
+            gdb_builder
+                .try_spawn(oob_src)
+                .context("gdb.create_session", "spawn GDB process")?,
+        ));
 
         let stream_buffer = Arc::new(Mutex::new(Vec::new()));
         let stream_buffer_clone = stream_buffer.clone();
@@ -264,11 +275,13 @@ impl GDBManager {
                             debug!("AsyncRecord: {:?}", results);
                         }
                         OutOfBandRecord::StreamRecord { kind, data } => {
-                            if matches!(kind, StreamKind::Console | StreamKind::Log | StreamKind::Target)
-                            {
-                                let mut buffer = stream_buffer_clone.lock().await;
-                                buffer.push(data.clone());
-                            }
+                        if matches!(
+                            kind,
+                            StreamKind::Console | StreamKind::Log | StreamKind::Target
+                        ) {
+                            let mut buffer = stream_buffer_clone.lock().await;
+                            push_stream_buffer_line(&mut buffer, data.clone());
+                        }
                             debug!("StreamRecord: {:?}", data);
                         }
                     },
@@ -280,10 +293,13 @@ impl GDBManager {
             }
         });
 
+        let gdb_stderr = gdb.clone();
         let stderr_handle = {
+            let gdb = gdb_stderr.lock().await;
             let mut process = gdb.process.lock().await;
             let stderr = process.stderr.take();
             drop(process);
+            drop(gdb);
             stderr.map(|stderr| {
                 let stream_buffer_clone = stream_buffer.clone();
                 tokio::spawn(async move {
@@ -295,7 +311,7 @@ impl GDBManager {
                             Ok(0) => break,
                             Ok(_) => {
                                 let mut buffer = stream_buffer_clone.lock().await;
-                                buffer.push(line.clone());
+                                push_stream_buffer_line(&mut buffer, line.clone());
                             }
                             Err(err) => {
                                 warn!("GDB stderr read error: {}", err);
@@ -344,26 +360,35 @@ impl GDBManager {
 
         self.sessions.lock().await.insert(session_id.clone(), handle);
 
-        // Send empty command to GDB to flush the welcome messages
-        let _ = self.send_command(&session_id, &MiCommand::empty()).await?;
+        let init_result: AppResult<()> = async {
+            // Send empty command to GDB to flush the welcome messages.
+            self.send_command(&session_id, &MiCommand::empty())
+                .await?;
 
-        // lib_dir: configure shared-library search path and LD_LIBRARY_PATH
-        if let Some(ref lib_dir) = lib_dir {
-            let solib_cmd = MiCommand::cli_exec(
-                &format!("set solib-search-path \"{}\"", lib_dir.display()),
-            );
-            self.send_command(&session_id, &solib_cmd)
-                .await
-                .context("gdb.create_session", "set solib-search-path")?;
-
-            // LD_LIBRARY_PATH only makes sense for fresh exec (not attach/core)
-            if is_exec_run {
-                let env_cmd = MiCommand::cli_exec(
-                    &format!("set environment LD_LIBRARY_PATH \"{}\"", lib_dir.display()),
+            // lib_dir: configure shared-library search path and LD_LIBRARY_PATH.
+            if let Some(ref lib_dir) = lib_dir {
+                let solib_cmd = MiCommand::cli_exec(
+                    &format!("set solib-search-path \"{}\"", lib_dir.display()),
                 );
-                // Failure is non-fatal; older GDB versions may not support this
-                let _ = self.send_command(&session_id, &env_cmd).await;
+                self.send_command(&session_id, &solib_cmd)
+                    .await
+                    .context("gdb.create_session", "set solib-search-path")?;
+
+                // LD_LIBRARY_PATH only makes sense for fresh exec (not attach/core).
+                if is_exec_run {
+                    let env_cmd = MiCommand::cli_exec(
+                        &format!("set environment LD_LIBRARY_PATH \"{}\"", lib_dir.display()),
+                    );
+                    // Failure is non-fatal; older GDB versions may not support this.
+                    let _ = self.send_command(&session_id, &env_cmd).await;
+                }
             }
+            Ok(())
+        }
+        .await;
+        if let Err(err) = init_result {
+            let _ = self.close_session(&session_id).await;
+            return Err(err);
         }
 
         Ok(session_id)
@@ -390,17 +415,27 @@ impl GDBManager {
 
     /// Close session
     pub async fn close_session(&self, session_id: &str) -> AppResult<()> {
-        let _ = match self.send_command_with_timeout(session_id, &MiCommand::exit()).await {
-            Ok(result) => Some(result),
-            Err(e) => {
-                warn!("GDB exit command timed out, forcing process termination: {}", e.to_string());
-                // Ignore timeout error, continue to force terminate the process
-                None
-            }
+        let gdb_handle = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(session_id).map(|handle| handle.gdb.clone())
         };
 
-        let mut sessions = self.sessions.lock().await;
-        let handle = sessions.remove(session_id);
+        if let Some(gdb) = gdb_handle {
+            if tokio::time::timeout(Duration::from_secs(self.config.command_timeout), async {
+                let mut gdb = gdb.lock().await;
+                gdb.execute(MiCommand::exit()).await
+            })
+            .await
+            .is_err()
+            {
+                warn!("GDB exit command timed out, forcing process termination");
+            }
+        }
+
+        let handle = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.remove(session_id)
+        };
 
         if let Some(handle) = handle {
             handle.oob_handle.abort();
@@ -410,10 +445,12 @@ impl GDBManager {
             if let Some(pty_handle) = handle.pty_read_handle {
                 pty_handle.abort();
             }
-            // Terminate GDB process
-            let mut process = handle.gdb.process.lock().await;
-            let _ = process.kill().await; // Ignore possible errors, process may have already terminated
-            drop(process);
+
+            let gdb = handle.gdb.lock().await;
+            {
+                let mut process = gdb.process.lock().await;
+                let _ = process.kill().await; // Ignore possible errors, process may have already terminated
+            }
 
             // Terminate QEMU process (if any).
             #[cfg(any(feature = "qemu-user", feature = "qemu-system"))]
@@ -627,9 +664,11 @@ impl GDBManager {
         };
 
         let (oob_src, mut oob_sink) = mpsc::channel(2048);
-        let gdb = gdb_builder
-            .try_spawn(oob_src)
-            .context("qemu.create_user_session", "spawn GDB process")?;
+        let gdb = Arc::new(Mutex::new(
+            gdb_builder
+                .try_spawn(oob_src)
+                .context("qemu.create_user_session", "spawn GDB process")?,
+        ));
 
         let stream_buffer = Arc::new(Mutex::new(Vec::new()));
         let stream_buffer_clone = stream_buffer.clone();
@@ -645,7 +684,8 @@ impl GDBManager {
                                 kind,
                                 StreamKind::Console | StreamKind::Log | StreamKind::Target
                             ) {
-                                stream_buffer_clone.lock().await.push(data.clone());
+                                let mut buffer = stream_buffer_clone.lock().await;
+                                push_stream_buffer_line(&mut buffer, data.clone());
                             }
                             debug!("StreamRecord: {:?}", data);
                         }
@@ -659,10 +699,13 @@ impl GDBManager {
         });
 
         // Capture GDB's own stderr.
+        let gdb_stderr = gdb.clone();
         let stderr_handle = {
+            let gdb = gdb_stderr.lock().await;
             let mut process = gdb.process.lock().await;
             let stderr = process.stderr.take();
             drop(process);
+            drop(gdb);
             stderr.map(|stderr| {
                 let buf_clone = stream_buffer.clone();
                 tokio::spawn(async move {
@@ -673,7 +716,8 @@ impl GDBManager {
                         match reader.read_line(&mut line).await {
                             Ok(0) | Err(_) => break,
                             Ok(_) => {
-                                buf_clone.lock().await.push(line.clone());
+                                let mut buffer = buf_clone.lock().await;
+                                push_stream_buffer_line(&mut buffer, line.clone());
                             }
                         }
                     }
@@ -715,7 +759,10 @@ impl GDBManager {
         self.sessions.lock().await.insert(session_id.clone(), handle);
 
         // Flush GDB welcome messages.
-        let _ = self.send_command(&session_id, &MiCommand::empty()).await?;
+        if let Err(err) = self.send_command(&session_id, &MiCommand::empty()).await {
+            let _ = self.close_session(&session_id).await;
+            return Err(err);
+        }
 
         // Connect GDB to the QEMU stub with retries.
         let target_cmd =
@@ -756,6 +803,12 @@ impl GDBManager {
             match self.send_command(&session_id, &target_cmd).await {
                 Ok(_) => {
                     connect_err = None;
+                    break;
+                }
+                // ^error from GDB means the connection was explicitly refused —
+                // retrying will not help, so break immediately.
+                Err(e) if matches!(e.kind, crate::error::ErrorKind::Backend) => {
+                    connect_err = Some(e);
                     break;
                 }
                 Err(e) if attempt < 4 => {
@@ -959,9 +1012,11 @@ impl GDBManager {
         };
 
         let (oob_src, mut oob_sink) = mpsc::channel(2048);
-        let gdb = gdb_builder
-            .try_spawn(oob_src)
-            .context("qemu.create_system_session", "spawn GDB process")?;
+        let gdb = Arc::new(Mutex::new(
+            gdb_builder
+                .try_spawn(oob_src)
+                .context("qemu.create_system_session", "spawn GDB process")?,
+        ));
 
         let stream_buffer = Arc::new(Mutex::new(Vec::new()));
         let stream_buffer_clone = stream_buffer.clone();
@@ -977,7 +1032,8 @@ impl GDBManager {
                                 kind,
                                 StreamKind::Console | StreamKind::Log | StreamKind::Target
                             ) {
-                                stream_buffer_clone.lock().await.push(data.clone());
+                                let mut buffer = stream_buffer_clone.lock().await;
+                                push_stream_buffer_line(&mut buffer, data.clone());
                             }
                         }
                     },
@@ -986,10 +1042,13 @@ impl GDBManager {
             }
         });
 
+        let gdb_stderr = gdb.clone();
         let stderr_handle = {
+            let gdb = gdb_stderr.lock().await;
             let mut process = gdb.process.lock().await;
             let stderr = process.stderr.take();
             drop(process);
+            drop(gdb);
             stderr.map(|stderr| {
                 let buf_clone = stream_buffer.clone();
                 tokio::spawn(async move {
@@ -999,7 +1058,10 @@ impl GDBManager {
                         line.clear();
                         match reader.read_line(&mut line).await {
                             Ok(0) | Err(_) => break,
-                            Ok(_) => buf_clone.lock().await.push(line.clone()),
+                            Ok(_) => {
+                                let mut buffer = buf_clone.lock().await;
+                                push_stream_buffer_line(&mut buffer, line.clone());
+                            }
                         }
                     }
                 })
@@ -1038,16 +1100,56 @@ impl GDBManager {
         self.sessions.lock().await.insert(session_id.clone(), handle);
 
         // Flush GDB welcome.
-        let _ = self.send_command(&session_id, &MiCommand::empty()).await?;
+        if let Err(err) = self.send_command(&session_id, &MiCommand::empty()).await {
+            let _ = self.close_session(&session_id).await;
+            return Err(err);
+        }
 
         // Connect to QEMU stub with retries.
         let target_cmd =
             MiCommand::cli_exec(&format!("target remote localhost:{}", gdb_port));
         let mut connect_err: Option<crate::error::AppError> = None;
         for attempt in 0..5u32 {
+            // Detect premature QEMU exit before each attempt so callers get a
+            // meaningful error (crash / kernel panic) rather than a generic
+            // "target remote failed" message.
+            let early_exit: Option<(std::process::ExitStatus, Option<String>)> = {
+                let sessions = self.sessions.lock().await;
+                if let Some(h) = sessions.get(&session_id) {
+                    if let Some(ref qemu) = h.qemu {
+                        let status = qemu.child.lock().await.try_wait().ok().flatten();
+                        if let Some(status) = status {
+                            let last_err = qemu.stderr_lines.lock().await.last().cloned();
+                            Some((status, last_err))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some((status, last_line)) = early_exit {
+                let msg = format!(
+                    "QEMU exited prematurely (status={:?}) before GDB could connect; \
+                     last stderr: {:?}",
+                    status, last_line
+                );
+                let _ = self.close_session(&session_id).await;
+                return Err(AppError::backend("qemu.create_system_session", msg));
+            }
+
             match self.send_command(&session_id, &target_cmd).await {
                 Ok(_) => {
                     connect_err = None;
+                    break;
+                }
+                // ^error from GDB means the connection was explicitly refused —
+                // retrying will not help, so break immediately.
+                Err(e) if matches!(e.kind, crate::error::ErrorKind::Backend) => {
+                    connect_err = Some(e);
                     break;
                 }
                 Err(e) if attempt < 4 => {
@@ -1087,24 +1189,61 @@ impl GDBManager {
         Ok(session_id)
     }
 
+    /// Convert a MI result record with class `^error` or `^exit` into an
+    /// `AppError` so callers don't have to check the class themselves.
+    fn mi_result_to_error(
+        session_id: &str,
+        command: &MiCommand,
+        record: ResultRecord,
+    ) -> AppResult<ResultRecord> {
+        match record.class {
+            ResultClass::Error => {
+                let op = if command.operation.is_empty() { "<raw-mi>" } else { command.operation };
+                Err(AppError::backend(
+                    "gdb.send_command",
+                    format!(
+                        "MI command '{}' failed in session {}: {}",
+                        op, session_id, record.results
+                    ),
+                )
+                .with_field("result_class", "error")
+                .with_field("session_id", session_id))
+            }
+            ResultClass::Exit => Err(AppError::backend(
+                "gdb.send_command",
+                format!(
+                    "GDB exited unexpectedly in session {} (command: {})",
+                    session_id, command.operation
+                ),
+            )),
+            _ => Ok(record),
+        }
+    }
+
     /// Send GDB command
     pub async fn send_command(
         &self,
         session_id: &str,
         command: &MiCommand,
     ) -> AppResult<ResultRecord> {
-        let mut sessions = self.sessions.lock().await;
-        let handle = sessions.get_mut(session_id).ok_or_else(|| {
-            AppError::not_found(
-                "gdb.send_command",
-                format!("Session {} does not exist", session_id),
-            )
-        })?;
+        let gdb = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(session_id)
+                .ok_or_else(|| {
+                    AppError::not_found(
+                        "gdb.send_command",
+                        format!("Session {} does not exist", session_id),
+                    )
+                })?
+                .gdb
+                .clone()
+        };
 
-        let record = handle.gdb.execute(command).await?;
-        let output = record.results.to_string();
-
-        debug!("GDB output: {}", output);
+        let mut gdb = gdb.lock().await;
+        let record = gdb.execute(command).await?;
+        let record = Self::mi_result_to_error(session_id, command, record)?;
+        debug!("GDB output: {}", record.results);
         Ok(record)
     }
 
@@ -1129,44 +1268,65 @@ impl GDBManager {
 
     async fn ensure_stopped(&self, session_id: &str, timeout: Duration) -> AppResult<()> {
         let is_running = {
-            let sessions = self.sessions.lock().await;
-            let handle = sessions.get(session_id).ok_or_else(|| {
-                AppError::not_found(
-                    "gdb.ensure_stopped",
-                    format!("Session {} does not exist", session_id),
-                )
-            })?;
-            handle.gdb.is_running()
+            let gdb = {
+                let sessions = self.sessions.lock().await;
+                sessions
+                    .get(session_id)
+                    .ok_or_else(|| {
+                        AppError::not_found(
+                            "gdb.ensure_stopped",
+                            format!("Session {} does not exist", session_id),
+                        )
+                })?
+                    .gdb
+                    .clone()
+            };
+            let gdb = gdb.lock().await;
+            gdb.is_running()
         };
 
         if !is_running {
             return Ok(());
         }
 
-        {
+        let gdb = {
             let sessions = self.sessions.lock().await;
-            let handle = sessions.get(session_id).ok_or_else(|| {
-                AppError::not_found(
-                    "gdb.ensure_stopped",
-                    format!("Session {} does not exist", session_id),
-                )
-            })?;
-            handle.gdb.interrupt_execution().await.map_err(|e| {
-                AppError::backend("gdb.ensure_stopped", format!("interrupt failed: {}", e))
-            })?;
-        }
-
-        let start = Instant::now();
-        loop {
-            let is_running = {
-                let sessions = self.sessions.lock().await;
-                let handle = sessions.get(session_id).ok_or_else(|| {
+            sessions
+                .get(session_id)
+                .ok_or_else(|| {
                     AppError::not_found(
                         "gdb.ensure_stopped",
                         format!("Session {} does not exist", session_id),
                     )
-                })?;
-                handle.gdb.is_running()
+                })?
+                .gdb
+                .clone()
+        };
+        let gdb = gdb.lock().await;
+        gdb.interrupt_execution()
+            .await
+            .map_err(|e| {
+                AppError::backend("gdb.ensure_stopped", format!("interrupt failed: {}", e))
+            })?;
+
+        let start = Instant::now();
+        loop {
+            let is_running = {
+                let gdb = {
+                    let sessions = self.sessions.lock().await;
+                    sessions
+                        .get(session_id)
+                        .ok_or_else(|| {
+                            AppError::not_found(
+                                "gdb.ensure_stopped",
+                                format!("Session {} does not exist", session_id),
+                            )
+                        })?
+                        .gdb
+                        .clone()
+                };
+                let gdb = gdb.lock().await;
+                gdb.is_running()
             };
             if !is_running {
                 let mut sessions = self.sessions.lock().await;
@@ -1209,14 +1369,20 @@ impl GDBManager {
         // For ExecContinue (QEMU/remote), a timeout or a "GDB is busy" response
         // just means the kernel is already running — treat it as success.
         // Only hard errors (explicit ^error from GDB, session not found, …) propagate.
+        let mut should_set_running = false;
         let result_str = match launch_mode {
             LaunchMode::ExecRun => {
                 let response = self.send_command_with_timeout(session_id, &cmd).await?;
+                should_set_running = true;
                 response.results.to_string()
             }
             LaunchMode::ExecContinue => {
                 match self.send_command_with_timeout(session_id, &cmd).await {
-                    Ok(response) => response.results.to_string(),
+                    Ok(response) => {
+                        // Only mark running when GDB explicitly confirmed ^running.
+                        should_set_running = response.class == ResultClass::Running;
+                        response.results.to_string()
+                    }
                     Err(ref e)
                         if matches!(
                             e.kind,
@@ -1224,6 +1390,10 @@ impl GDBManager {
                         ) =>
                     {
                         // Kernel is already running or GDB stub did not echo ^running.
+                        // Do NOT set should_set_running here — process_output's *running
+                        // handler may have already raised is_running, and unconditionally
+                        // overwriting a *stopped that arrived in the meantime would cause
+                        // stop_debugging to time out.
                         warn!(
                             session_id = %session_id,
                             error = %e,
@@ -1237,10 +1407,35 @@ impl GDBManager {
             }
         };
 
-        // Update session status
-        let mut sessions = self.sessions.lock().await;
-        if let Some(handle) = sessions.get_mut(session_id) {
-            handle.info.status = GDBSessionStatus::Running;
+        // Update session status and conditionally synchronise the GDB is_running
+        // AtomicBool.  We skip set_running(true) when:
+        //   - process_output already set is_running=true via *running (fine to skip),
+        //   - process_output already set is_running=false via *stopped (must not overwrite).
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(handle) = sessions.get_mut(session_id) {
+                handle.info.status = GDBSessionStatus::Running;
+            }
+        }
+
+        if should_set_running {
+            let gdb = {
+                let sessions = self.sessions.lock().await;
+                sessions
+                    .get(session_id)
+                    .ok_or_else(|| {
+                        AppError::not_found(
+                            "gdb.start_debugging",
+                            format!("Session {} does not exist", session_id),
+                        )
+                    })?
+                    .gdb
+                    .clone()
+            };
+            let gdb = gdb.lock().await;
+            if !gdb.is_running() {
+                gdb.set_running(true);
+            }
         }
 
         Ok(result_str)
@@ -1427,16 +1622,33 @@ impl GDBManager {
         let command = MiCommand::data_list_register_names(reg_list);
         let response = self.send_command_with_timeout(session_id, &command).await?;
 
-        Ok(serde_json::from_value(
+        let names: Vec<String> = serde_json::from_value(
             response
                 .results
-                .get("register-values")
+                .get("register-names")
                 .ok_or_else(|| {
-                    AppError::not_found("gdb.get_register_names", "expect register-values")
+                    AppError::not_found("gdb.get_register_names", "expect register-names")
                 })?
                 .to_owned(),
         )
-        .context("gdb.get_register_names", "parse register names")?)
+        .context("gdb.get_register_names", "parse register names")?;
+
+        Ok(names
+            .into_iter()
+            .enumerate()
+            .map(|(number, name)| Register {
+                name: Some(name),
+                number,
+                value: None,
+                v2_int128: None,
+                v8_int32: None,
+                v4_int64: None,
+                v8_float: None,
+                v16_int8: None,
+                v4_int32: None,
+                error: None,
+            })
+            .collect())
     }
 
     /// Read memory contents

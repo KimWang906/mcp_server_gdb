@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use rmcp::handler::server::tool::ToolRouter;
-use rmcp::handler::server::router::tool::CallToolHandlerExt;
-use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo, ToolsCapability};
-use rmcp::{ErrorData, ServerHandler, tool, tool_handler};
 use mcp_server_gdb_macros::tool_router_with_gef;
+use rmcp::handler::server::router::tool::CallToolHandlerExt;
+use rmcp::handler::server::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::{ErrorData, ServerHandler, tool, tool_handler};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -84,7 +84,9 @@ struct CreateSessionParams {
     source_dir: Option<PathBuf>,
     args: Option<Vec<String>>,
     tty: Option<PathBuf>,
-    #[schemars(description = "Automatically create a PTY for inferior I/O separation. Default: true.")]
+    #[schemars(
+        description = "Automatically create a PTY for inferior I/O separation. Default: true."
+    )]
     create_pty: Option<bool>,
 
     // ── QEMU user-mode ──
@@ -176,8 +178,7 @@ struct GefFunctionParams {
 }
 
 fn json_text<T: Serialize>(value: &T) -> Result<String, ErrorData> {
-    serde_json::to_string(value)
-        .map_err(|error| ErrorData::internal_error(error.to_string(), None))
+    serde_json::to_string(value).map_err(|error| ErrorData::internal_error(error.to_string(), None))
 }
 
 fn format_gef_json_cli(tool: &str, args: Option<&str>) -> String {
@@ -191,11 +192,7 @@ fn format_gef_json_cli(tool: &str, args: Option<&str>) -> String {
 fn normalize_gef_json_command(command: &str, json: bool) -> String {
     let command = command.trim();
     if json && !command.starts_with("gef-json") {
-        if command.is_empty() {
-            "gef-json".to_string()
-        } else {
-            format!("gef-json {}", command)
-        }
+        if command.is_empty() { "gef-json".to_string() } else { format!("gef-json {}", command) }
     } else {
         command.to_string()
     }
@@ -342,8 +339,7 @@ impl GdbService {
                         "auto_fetch_libc is only supported with backend = qemu-user",
                     )));
                 }
-                let args =
-                    params.args.map(|a| a.into_iter().map(OsString::from).collect());
+                let args = params.args.map(|a| a.into_iter().map(OsString::from).collect());
                 let session_id = GDB_MANAGER
                     .create_session(
                         params.binary,
@@ -413,12 +409,8 @@ impl GdbService {
                         "gdb_port is required for backend = qemu-system",
                     ))
                 })?;
-                let qemu_args: Vec<OsString> = params
-                    .qemu_args
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(OsString::from)
-                    .collect();
+                let qemu_args: Vec<OsString> =
+                    params.qemu_args.unwrap_or_default().into_iter().map(OsString::from).collect();
                 let session_id = GDB_MANAGER
                     .create_qemu_system_session(
                         qemu_path.clone(),
@@ -495,7 +487,10 @@ impl GdbService {
         Ok(format!("Stopped debugging: {}", ret))
     }
 
-    #[tool(name = "get_breakpoints", description = "Get all breakpoints in the current GDB session")]
+    #[tool(
+        name = "get_breakpoints",
+        description = "Get all breakpoints in the current GDB session"
+    )]
     async fn get_breakpoints(
         &self,
         Parameters(SessionIdParams { session_id }): Parameters<SessionIdParams>,
@@ -553,7 +548,10 @@ impl GdbService {
         Ok(format!("Stack frames: {}", json_text(&frames)?))
     }
 
-    #[tool(name = "get_local_variables", description = "Get local variables in the current stack frame")]
+    #[tool(
+        name = "get_local_variables",
+        description = "Get local variables in the current stack frame"
+    )]
     async fn get_local_variables(
         &self,
         Parameters(params): Parameters<FrameParams>,
@@ -591,7 +589,10 @@ impl GdbService {
         Ok(format!("Registers: {}", json_text(&registers)?))
     }
 
-    #[tool(name = "get_register_names", description = "Get register names in the current GDB session")]
+    #[tool(
+        name = "get_register_names",
+        description = "Get register names in the current GDB session"
+    )]
     async fn get_register_names(
         &self,
         Parameters(params): Parameters<RegistersParams>,
@@ -774,7 +775,12 @@ impl GdbService {
     gef_command_tool!(trace_run_tool, "trace-run", "trace-run", "Trace execution");
 
     // Process
-    gef_command_tool!(process_status_tool, "process-status", "process-status", "Show process status");
+    gef_command_tool!(
+        process_status_tool,
+        "process-status",
+        "process-status",
+        "Show process status"
+    );
     gef_command_tool!(process_search_tool, "process-search", "process-search", "Search processes");
     gef_command_tool!(hijack_fd_tool, "hijack-fd", "hijack-fd", "Hijack file descriptor");
 
@@ -807,15 +813,8 @@ impl GdbService {
 #[tool_handler]
 impl ServerHandler for GdbService {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability { list_changed: Some(false) }),
-                ..Default::default()
-            },
-            server_info: Implementation::from_build_env(),
-            instructions: None,
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2024_11_05)
     }
 }
 
@@ -823,7 +822,7 @@ impl ServerHandler for GdbService {
 mod tests {
     use super::{format_gef_json_cli, normalize_gef_json_command};
 
-    const TOOLS: &[&str] = &[
+    const TOOLS: [&str; 45] = [
         "checksec",
         "canary",
         "aslr",

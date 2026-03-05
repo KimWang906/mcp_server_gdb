@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use rmcp::ServiceExt;
-use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Content, Implementation, ProtocolVersion};
+use rmcp::model::{
+    CallToolRequestParams, ClientCapabilities, ClientInfo, Content, Implementation, ProtocolVersion,
+};
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use serde_json::{Value, json};
 use tracing::{debug, info};
@@ -47,12 +49,10 @@ async fn call_tool(
     info!("Calling tool: {}", tool_name);
     debug!("Params: {:?}", params);
     let arguments = params.map(rmcp::model::object);
-    let request = CallToolRequestParams {
-        meta: None,
-        name: tool_name.to_string().into(),
-        arguments,
-        task: None,
-    };
+    let mut request = CallToolRequestParams::new(tool_name.to_string());
+    if let Some(args) = arguments {
+        request = request.with_arguments(args);
+    }
     let response = client.peer().call_tool(request).await?;
     Ok(response.content)
 }
@@ -73,19 +73,9 @@ async fn main() -> Result<()> {
 
     info!("Starting GDB client");
 
-    let client_info = ClientInfo {
-        meta: None,
-        protocol_version: ProtocolVersion::V_2024_11_05,
-        capabilities: ClientCapabilities::default(),
-        client_info: Implementation {
-            name: "gdb-client".to_string(),
-            title: None,
-            description: None,
-            version: "1.0".to_string(),
-            icons: None,
-            website_url: None,
-        },
-    };
+    let client_info =
+        ClientInfo::new(ClientCapabilities::default(), Implementation::new("gdb-client", "1.0"))
+            .with_protocol_version(ProtocolVersion::V_2024_11_05);
 
     let client = match args.transport {
         TransportType::Stdio => {

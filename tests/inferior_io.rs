@@ -30,6 +30,7 @@ async fn test_inferior_output_via_pty() -> Result<(), Box<dyn std::error::Error>
             None,
             None,
             Some(true),
+            None,
         )
         .await?;
 

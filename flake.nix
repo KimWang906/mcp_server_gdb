@@ -18,7 +18,7 @@
       };
 
       rustToolchain = (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml).override {
-        extensions = ["rust-src"];
+        extensions = ["rust-src" "rust-analyzer"];
       };
 
       cargoToml = builtins.fromTOML (builtins.readFile "${self}/Cargo.toml");
@@ -53,11 +53,12 @@
       };
 
       devShells.default = pkgs.mkShell {
-        inputsFrom = [mcp-server-gdb-pkg];
         buildInputs = with pkgs; [
           rustToolchain
-          cargo
-          clippy
+
+          # Build utilities needed by C build scripts (e.g. openssl-sys, aws-lc-sys).
+          pkg-config
+          perl
 
           # C toolchain: linker (cc) + headers required by build scripts.
           gcc

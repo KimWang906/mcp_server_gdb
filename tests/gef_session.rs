@@ -35,6 +35,7 @@ async fn test_create_gef_session() -> Result<(), Box<dyn std::error::Error>> {
             Some(PathBuf::from("vendor/gef/gef.py")),
             Some(PathBuf::from("configs/gef.rc")),
             Some(true),
+            None,
         )
         .await?;
 

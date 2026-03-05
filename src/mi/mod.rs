@@ -218,13 +218,20 @@ impl GDBBuilder {
 }
 
 impl GDB {
-    #[cfg(unix)]
-    #[allow(dead_code)]
-    pub async fn interrupt_execution(&self) -> Result<(), nix::Error> {
-        use nix::sys::signal;
-        use nix::unistd::Pid;
-        signal::kill(Pid::from_raw(self.process.lock().await.id().unwrap() as i32), signal::SIGINT)
-    }
+#[cfg(unix)]
+#[allow(dead_code)]
+pub async fn interrupt_execution(&self) -> Result<(), nix::Error> {
+    use nix::sys::signal;
+    use nix::errno::Errno;
+    use nix::unistd::Pid;
+    let pid = self
+        .process
+        .lock()
+        .await
+        .id()
+        .ok_or_else(|| nix::Error::from(Errno::ESRCH))?;
+    signal::kill(Pid::from_raw(pid as i32), signal::SIGINT)
+}
 
     #[cfg(windows)]
     #[allow(dead_code)]
@@ -244,6 +251,15 @@ impl GDB {
 
     pub fn is_running(&self) -> bool {
         self.is_running.load(Ordering::SeqCst)
+    }
+
+    /// Explicitly override the is_running flag.
+    ///
+    /// Used when the GDB stub does not send `^running` or `*running` but we
+    /// can infer the running state from higher-level protocol logic (e.g.
+    /// `exec-continue` timeout on QEMU system mode).
+    pub fn set_running(&self, running: bool) {
+        self.is_running.store(running, Ordering::SeqCst);
     }
 
     pub fn new_token(&mut self) -> u64 {

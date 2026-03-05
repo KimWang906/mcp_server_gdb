@@ -287,7 +287,10 @@ pub async fn spawn_qemu_system(
     let mut cmd = tokio::process::Command::new(qemu_path);
     cmd.args(qemu_args);
     cmd.args(extra_args);
-    cmd.stdout(std::process::Stdio::null()); // prevent VM console from polluting MCP JSON-RPC stdout
+    // Redirect all stdio so QEMU never inherits the MCP server's stdin/stdout
+    // file descriptors, which carry the JSON-RPC stream.
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::piped());
 
     cmd.spawn().map_err(|e| {

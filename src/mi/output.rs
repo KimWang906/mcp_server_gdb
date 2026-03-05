@@ -118,12 +118,17 @@ pub async fn process_output<T: AsyncRead + Unpin>(
                     Ok(r) => r,
                     Err(e) => {
                         error!("PARSING ERROR: {}", e);
-                        let _ = out_of_band_pipe
-                            .send(OutOfBandRecord::StreamRecord {
+                        if out_of_band_pipe
+                            .try_send(OutOfBandRecord::StreamRecord {
                                 kind: StreamKind::Target,
                                 data: buffer.clone(),
                             })
-                            .await;
+                            .is_err()
+                        {
+                            debug!(
+                                "process_output: OOB stream buffer full or closed, dropping parse output"
+                            );
+                        }
                         continue;
                     }
                 };
@@ -143,10 +148,21 @@ pub async fn process_output<T: AsyncRead + Unpin>(
                         }
                     }
                     Output::OutOfBand(record) => {
-                        if let OutOfBandRecord::AsyncRecord { class: AsyncClass::Stopped, .. } =
-                            record
-                        {
-                            is_running.store(false, Ordering::SeqCst);
+                        // Mirror is_running state from async OOB records so that
+                        // QEMU GDB stubs that send *running/*stopped without the
+                        // corresponding ^running result record are handled correctly.
+                        match &record {
+                            OutOfBandRecord::AsyncRecord {
+                                class: AsyncClass::Running, ..
+                            } => {
+                                is_running.store(true, Ordering::SeqCst);
+                            }
+                            OutOfBandRecord::AsyncRecord {
+                                class: AsyncClass::Stopped, ..
+                            } => {
+                                is_running.store(false, Ordering::SeqCst);
+                            }
+                            _ => {}
                         }
                         // try_send so a full OOB pipe never stalls this loop and
                         // prevents result records from being forwarded.
@@ -324,7 +340,9 @@ fn key_value(input: &str) -> IResult<&str, (String, Value)> {
 }
 
 fn token(input: &str) -> IResult<&str, u64> {
-    map(digit1, |values: &str| values.parse::<u64>().unwrap()).parse(input)
+    // Use map_res so an overflow (buggy GDB stub sending > u64::MAX) is
+    // propagated as a nom parse error rather than panicking with unwrap().
+    map_res(digit1, |values: &str| values.parse::<u64>()).parse(input)
 }
 
 /// \[token\] "^" result-class ( "," result )* nl,
