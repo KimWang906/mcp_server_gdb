@@ -39,7 +39,11 @@
         buildInputs = with pkgs; [
           gdb
           openssl
+          openssl.dev
         ];
+
+        # Use system OpenSSL provided by buildInputs instead of vendored build.
+        OPENSSL_NO_VENDOR = "1";
       };
     in {
       packages.default = mcp-server-gdb-pkg;
@@ -55,11 +59,27 @@
           cargo
           clippy
 
+          # C toolchain: linker (cc) + headers required by build scripts.
+          gcc
+          binutils
+
+          # OpenSSL dev headers for openssl-sys (system, not vendored).
+          openssl
+          openssl.dev
+
+          # GDB runtime: used by integration tests and direct debugging.
+          gdb
+
           # QEMU: user-mode + system-mode for all target architectures.
           # Provides qemu-<arch> and qemu-system-<arch> binaries used by the
           # qemu-user / qemu-system backend and the test suite.
           qemu
         ];
+
+        # Tell openssl-sys to use the system OpenSSL (not the vendored build)
+        # so that the Perl Configure script and C compiler are not required at
+        # `cargo check / build` time inside the dev shell.
+        OPENSSL_NO_VENDOR = "1";
 
         shellHook = ''
           echo "Development environment activated"
