@@ -171,22 +171,14 @@ impl GDBManager {
             }
             let pty_system = native_pty_system();
             let pair = pty_system
-                .openpty(PtySize {
-                    rows: 24,
-                    cols: 80,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
+                .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
                 .context("gdb.create_session", "open PTY")?;
 
             let slave_name = {
                 #[cfg(unix)]
                 {
                     pair.master.tty_name().ok_or_else(|| {
-                        AppError::backend(
-                            "gdb.create_session",
-                            "Failed to resolve PTY slave name",
-                        )
+                        AppError::backend("gdb.create_session", "Failed to resolve PTY slave name")
                     })?
                 }
                 #[cfg(windows)]
@@ -199,14 +191,10 @@ impl GDBManager {
             };
             tty_path = Some(slave_name);
 
-            let reader = pair
-                .master
-                .try_clone_reader()
-                .context("gdb.create_session", "clone PTY reader")?;
-            let writer = pair
-                .master
-                .take_writer()
-                .context("gdb.create_session", "take PTY writer")?;
+            let reader =
+                pair.master.try_clone_reader().context("gdb.create_session", "clone PTY reader")?;
+            let writer =
+                pair.master.take_writer().context("gdb.create_session", "take PTY writer")?;
 
             let output_buffer = Arc::new(Mutex::new(Vec::new()));
             let output_clone = output_buffer.clone();
@@ -260,9 +248,7 @@ impl GDBManager {
 
         let (oob_src, mut oob_sink) = mpsc::channel(2048);
         let gdb = Arc::new(Mutex::new(
-            gdb_builder
-                .try_spawn(oob_src)
-                .context("gdb.create_session", "spawn GDB process")?,
+            gdb_builder.try_spawn(oob_src).context("gdb.create_session", "spawn GDB process")?,
         ));
 
         let stream_buffer = Arc::new(Mutex::new(Vec::new()));
@@ -275,13 +261,13 @@ impl GDBManager {
                             debug!("AsyncRecord: {:?}", results);
                         }
                         OutOfBandRecord::StreamRecord { kind, data } => {
-                        if matches!(
-                            kind,
-                            StreamKind::Console | StreamKind::Log | StreamKind::Target
-                        ) {
-                            let mut buffer = stream_buffer_clone.lock().await;
-                            push_stream_buffer_line(&mut buffer, data.clone());
-                        }
+                            if matches!(
+                                kind,
+                                StreamKind::Console | StreamKind::Log | StreamKind::Target
+                            ) {
+                                let mut buffer = stream_buffer_clone.lock().await;
+                                push_stream_buffer_line(&mut buffer, data.clone());
+                            }
                             debug!("StreamRecord: {:?}", data);
                         }
                     },
@@ -362,23 +348,24 @@ impl GDBManager {
 
         let init_result: AppResult<()> = async {
             // Send empty command to GDB to flush the welcome messages.
-            self.send_command(&session_id, &MiCommand::empty())
-                .await?;
+            self.send_command(&session_id, &MiCommand::empty()).await?;
 
             // lib_dir: configure shared-library search path and LD_LIBRARY_PATH.
             if let Some(ref lib_dir) = lib_dir {
-                let solib_cmd = MiCommand::cli_exec(
-                    &format!("set solib-search-path \"{}\"", lib_dir.display()),
-                );
+                let solib_cmd = MiCommand::cli_exec(&format!(
+                    "set solib-search-path \"{}\"",
+                    lib_dir.display()
+                ));
                 self.send_command(&session_id, &solib_cmd)
                     .await
                     .context("gdb.create_session", "set solib-search-path")?;
 
                 // LD_LIBRARY_PATH only makes sense for fresh exec (not attach/core).
                 if is_exec_run {
-                    let env_cmd = MiCommand::cli_exec(
-                        &format!("set environment LD_LIBRARY_PATH \"{}\"", lib_dir.display()),
-                    );
+                    let env_cmd = MiCommand::cli_exec(&format!(
+                        "set environment LD_LIBRARY_PATH \"{}\"",
+                        lib_dir.display()
+                    ));
                     // Failure is non-fatal; older GDB versions may not support this.
                     let _ = self.send_command(&session_id, &env_cmd).await;
                 }
@@ -405,10 +392,7 @@ impl GDBManager {
     pub async fn get_session(&self, session_id: &str) -> AppResult<GDBSession> {
         let sessions = self.sessions.lock().await;
         let handle = sessions.get(session_id).ok_or_else(|| {
-            AppError::not_found(
-                "gdb.get_session",
-                format!("Session {} does not exist", session_id),
-            )
+            AppError::not_found("gdb.get_session", format!("Session {} does not exist", session_id))
         })?;
         Ok(handle.info.clone())
     }
@@ -538,8 +522,7 @@ impl GDBManager {
             if auto_fetch_libc {
                 #[cfg(feature = "libc-fetch")]
                 {
-                    let result =
-                        crate::libc_fetch::extract_sysroot(&binary, &elf_info).await?;
+                    let result = crate::libc_fetch::extract_sysroot(&binary, &elf_info).await?;
                     let sysroot_path = result.sysroot.clone();
                     _libc_work_dir_holder = Some(Box::new(result._work_dir));
                     Some(sysroot_path)
@@ -571,10 +554,7 @@ impl GDBManager {
                 .await?;
 
         // Take stdin pipe before moving `raw_child` into Arc<Mutex<>>.
-        let qemu_user_stdin = raw_child
-            .stdin
-            .take()
-            .map(|s| Arc::new(Mutex::new(s)));
+        let qemu_user_stdin = raw_child.stdin.take().map(|s| Arc::new(Mutex::new(s)));
 
         // Drain QEMU stderr into a rolling buffer for diagnostics.
         let stderr_lines = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -624,11 +604,8 @@ impl GDBManager {
         // Wrap in Arc so the monitor task and close_session can share ownership.
         let child_arc = Arc::new(Mutex::new(raw_child));
 
-        let qemu_process = QemuProcess {
-            child: child_arc.clone(),
-            port,
-            stderr_lines: stderr_lines.clone(),
-        };
+        let qemu_process =
+            QemuProcess { child: child_arc.clone(), port, stderr_lines: stderr_lines.clone() };
 
         // ── 6. Spawn GDB ──────────────────────────────────────────────────────
         let mut gef_script = gef_script;
@@ -765,8 +742,7 @@ impl GDBManager {
         }
 
         // Connect GDB to the QEMU stub with retries.
-        let target_cmd =
-            MiCommand::cli_exec(&format!("target remote localhost:{}", port));
+        let target_cmd = MiCommand::cli_exec(&format!("target remote localhost:{}", port));
         let mut connect_err: Option<crate::error::AppError> = None;
         for attempt in 0..5u32 {
             // Check for premature QEMU exit before each attempt.
@@ -874,9 +850,7 @@ impl GDBManager {
         // ── Serial socket injection ───────────────────────────────────────────
         // If the user hasn't already passed `-serial`, inject a Unix socket
         // chardev so we can capture VM console output in `inferior_output`.
-        let user_has_serial = qemu_args
-            .iter()
-            .any(|a| a.to_string_lossy() == "-serial");
+        let user_has_serial = qemu_args.iter().any(|a| a.to_string_lossy() == "-serial");
 
         let mut _serial_work_dir_holder: Option<Box<dyn std::any::Any + Send>> = None;
         let serial_sock_path: Option<PathBuf>;
@@ -902,9 +876,7 @@ impl GDBManager {
             }
             extra_args = vec![
                 OsString::from("-chardev"),
-                OsString::from(format!(
-                    "socket,id=mcp_serial,path={path_str},server=on,wait=off"
-                )),
+                OsString::from(format!("socket,id=mcp_serial,path={path_str},server=on,wait=off")),
                 OsString::from("-serial"),
                 OsString::from("chardev:mcp_serial"),
             ];
@@ -1106,8 +1078,7 @@ impl GDBManager {
         }
 
         // Connect to QEMU stub with retries.
-        let target_cmd =
-            MiCommand::cli_exec(&format!("target remote localhost:{}", gdb_port));
+        let target_cmd = MiCommand::cli_exec(&format!("target remote localhost:{}", gdb_port));
         let mut connect_err: Option<crate::error::AppError> = None;
         for attempt in 0..5u32 {
             // Detect premature QEMU exit before each attempt so callers get a
@@ -1269,14 +1240,12 @@ impl GDBManager {
     async fn ensure_stopped(&self, session_id: &str, timeout: Duration) -> AppResult<()> {
         let (gdb_handle, backend) = {
             let sessions = self.sessions.lock().await;
-            let handle = sessions
-                .get(session_id)
-                .ok_or_else(|| {
-                    AppError::not_found(
-                        "gdb.ensure_stopped",
-                        format!("Session {} does not exist", session_id),
-                    )
-                })?;
+            let handle = sessions.get(session_id).ok_or_else(|| {
+                AppError::not_found(
+                    "gdb.ensure_stopped",
+                    format!("Session {} does not exist", session_id),
+                )
+            })?;
             (handle.gdb.clone(), handle.info.backend.clone())
         };
 
@@ -1302,54 +1271,15 @@ impl GDBManager {
         }
 
         let mut gdb = gdb_handle.lock().await;
-        let interrupt_error = {
-            #[cfg(feature = "qemu-system")]
-            if backend == DebugBackendKind::QemuSystem {
-                let result = gdb.interrupt_execution().await;
-                match result {
-                    Ok(()) => {
-                        debug!(
-                            session_id = %session_id,
-                            "ensure_stopped: SIGINT sent to GDB for qemu-system"
-                        );
-                        Ok(())
-                    }
-                    Err(sigint_err) => {
-                        warn!(
-                            session_id = %session_id,
-                            error = %sigint_err,
-                            "ensure_stopped: SIGINT failed, fallback ctrl-c"
-                        );
-                        gdb.interrupt_execution_ctrl_c().await.map_err(|ctrl_err| {
-                            AppError::backend(
-                                "gdb.ensure_stopped",
-                                format!(
-                                    "interrupt failed: SIGINT={}; ctrl-c={}",
-                                    sigint_err, ctrl_err
-                                ),
-                            )
-                        })
-                    }
-                }
-            } else {
-                gdb.interrupt_execution()
-                    .await
-                    .map_err(|e| {
-                        AppError::backend(
-                            "gdb.ensure_stopped",
-                            format!("interrupt failed: {}", e),
-                        )
-                    })
-            }
-            #[cfg(not(feature = "qemu-system"))]
-            gdb.interrupt_execution().await.map_err(|e| {
-                AppError::backend("gdb.ensure_stopped", format!("interrupt failed: {}", e))
-            })
-        };
+        let interrupt_result = gdb
+            .interrupt_execution()
+            .await
+            .map_err(|e| AppError::backend("gdb.ensure_stopped", format!("interrupt failed: {e}")));
         drop(gdb);
-        if let Err(e) = interrupt_error {
+        if let Err(e) = interrupt_result {
             return Err(e);
         }
+        debug!(session_id = %session_id, "ensure_stopped: interrupt sent");
 
         let status_update = async {
             let mut last_status_log = Instant::now();
@@ -1381,10 +1311,9 @@ impl GDBManager {
         match tokio::time::timeout(timeout, status_update).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => Err(err),
-            Err(_) => Err(AppError::timeout(
-                "gdb.ensure_stopped",
-                "Timeout waiting for GDB to stop",
-            )),
+            Err(_) => {
+                Err(AppError::timeout("gdb.ensure_stopped", "Timeout waiting for GDB to stop"))
+            }
         }
     }
 
@@ -1466,11 +1395,11 @@ impl GDBManager {
                 let sessions = self.sessions.lock().await;
                 sessions
                     .get(session_id)
-                .ok_or_else(|| {
-                    AppError::not_found(
-                        "gdb.start_debugging",
-                        format!("Session {} does not exist", session_id),
-                    )
+                    .ok_or_else(|| {
+                        AppError::not_found(
+                            "gdb.start_debugging",
+                            format!("Session {} does not exist", session_id),
+                        )
                     })?
                     .gdb
                     .clone()
@@ -1498,6 +1427,7 @@ impl GDBManager {
             let gdb = gdb.lock().await;
             gdb.is_running()
         };
+        #[cfg(feature = "qemu-system")]
         if backend == DebugBackendKind::QemuSystem && !is_running {
             warn!(
                 session_id = %session_id,
@@ -1559,8 +1489,7 @@ impl GDBManager {
             .get("body")
             .ok_or_else(|| AppError::not_found("gdb.get_breakpoints", "body not found"))?;
         let body = normalize_mi_list(body.to_owned(), "bkpt");
-        Ok(serde_json::from_value(body)
-            .context("gdb.get_breakpoints", "parse breakpoint table")?)
+        Ok(serde_json::from_value(body).context("gdb.get_breakpoints", "parse breakpoint table")?)
     }
 
     /// Set breakpoint
@@ -1600,10 +1529,7 @@ impl GDBManager {
         );
         let response = self.send_command_with_timeout(session_id, &command).await?;
         if response.class != ResultClass::Done {
-            return Err(AppError::backend(
-                "gdb.delete_breakpoint",
-                response.results.to_string(),
-            ));
+            return Err(AppError::backend("gdb.delete_breakpoint", response.results.to_string()));
         }
 
         Ok(())
@@ -1620,8 +1546,7 @@ impl GDBManager {
             return Ok(Vec::new());
         };
         let stack = normalize_mi_list(stack.to_owned(), "frame");
-        Ok(serde_json::from_value(stack)
-            .context("gdb.get_stack_frames", "parse stack frames")?)
+        Ok(serde_json::from_value(stack).context("gdb.get_stack_frames", "parse stack frames")?)
     }
 
     /// Get local variables
@@ -1677,9 +1602,7 @@ impl GDBManager {
             response
                 .results
                 .get("register-values")
-                .ok_or_else(|| {
-                    AppError::not_found("gdb.get_registers", "expect register-values")
-                })?
+                .ok_or_else(|| AppError::not_found("gdb.get_registers", "expect register-values"))?
                 .to_owned(),
         )
         .context("gdb.get_registers", "parse register values")?;
@@ -1812,11 +1735,8 @@ impl GDBManager {
         let timeout = timeout.unwrap_or_else(|| Duration::from_secs(self.config.command_timeout));
         self.ensure_stopped(session_id, timeout).await?;
 
-        let commands: Vec<&str> = command
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect();
+        let commands: Vec<&str> =
+            command.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
 
         let mut output = String::new();
         for cmd in commands {
@@ -1848,8 +1768,7 @@ impl GDBManager {
             match self.send_command_with_timeout(session_id, &mi_command).await {
                 Ok(_) => break,
                 Err(err)
-                    if attempt == 0
-                        && matches!(err.kind, ErrorKind::Busy | ErrorKind::Timeout) =>
+                    if attempt == 0 && matches!(err.kind, ErrorKind::Busy | ErrorKind::Timeout) =>
                 {
                     self.ensure_stopped(session_id, timeout).await?;
                     attempt += 1;
@@ -1881,10 +1800,7 @@ impl GDBManager {
 
         let mut sessions = self.sessions.lock().await;
         let handle = sessions.get_mut(session_id).ok_or_else(|| {
-            AppError::not_found(
-                "gdb.execute_cli",
-                format!("Session {} does not exist", session_id),
-            )
+            AppError::not_found("gdb.execute_cli", format!("Session {} does not exist", session_id))
         })?;
         let mut buffer = handle.stream_buffer.lock().await;
         let output = buffer.join("");
@@ -1895,14 +1811,12 @@ impl GDBManager {
     /// Read buffered inferior output from the PTY master.
     pub async fn get_inferior_output(&self, session_id: &str) -> AppResult<String> {
         let mut sessions = self.sessions.lock().await;
-        let handle = sessions
-            .get_mut(session_id)
-            .ok_or_else(|| {
-                AppError::not_found(
-                    "gdb.get_inferior_output",
-                    format!("Session {} does not exist", session_id),
-                )
-            })?;
+        let handle = sessions.get_mut(session_id).ok_or_else(|| {
+            AppError::not_found(
+                "gdb.get_inferior_output",
+                format!("Session {} does not exist", session_id),
+            )
+        })?;
         let output = handle.inferior_output.as_ref().ok_or_else(|| {
             AppError::invalid_argument(
                 "gdb.get_inferior_output",
@@ -1920,14 +1834,12 @@ impl GDBManager {
     /// Send input to the inferior process via PTY.
     pub async fn send_inferior_input(&self, session_id: &str, input: &str) -> AppResult<()> {
         let mut sessions = self.sessions.lock().await;
-        let handle = sessions
-            .get_mut(session_id)
-            .ok_or_else(|| {
-                AppError::not_found(
-                    "gdb.send_inferior_input",
-                    format!("Session {} does not exist", session_id),
-                )
-            })?;
+        let handle = sessions.get_mut(session_id).ok_or_else(|| {
+            AppError::not_found(
+                "gdb.send_inferior_input",
+                format!("Session {} does not exist", session_id),
+            )
+        })?;
         // QEMU sessions do not use PTY for inferior I/O.
         // System-mode: route input to the serial Unix socket.
         #[cfg(feature = "qemu-system")]
@@ -1944,9 +1856,7 @@ impl GDBManager {
             w.write_all(input.as_bytes())
                 .await
                 .context("gdb.send_inferior_input", "write serial socket")?;
-            w.flush()
-                .await
-                .context("gdb.send_inferior_input", "flush serial socket")?;
+            w.flush().await.context("gdb.send_inferior_input", "flush serial socket")?;
             return Ok(());
         }
         // User-mode: forward input to the piped stdin of the QEMU child.
@@ -1963,17 +1873,16 @@ impl GDBManager {
             w.write_all(input.as_bytes())
                 .await
                 .context("gdb.send_inferior_input", "write QEMU user-mode stdin")?;
-            w.flush()
-                .await
-                .context("gdb.send_inferior_input", "flush QEMU user-mode stdin")?;
+            w.flush().await.context("gdb.send_inferior_input", "flush QEMU user-mode stdin")?;
             return Ok(());
         }
         let writer = handle.pty_writer.as_mut().ok_or_else(|| {
-            AppError::invalid_argument("gdb.send_inferior_input", "PTY is not enabled for this session")
+            AppError::invalid_argument(
+                "gdb.send_inferior_input",
+                "PTY is not enabled for this session",
+            )
         })?;
-        writer
-            .write_all(input.as_bytes())
-            .context("gdb.send_inferior_input", "write PTY input")?;
+        writer.write_all(input.as_bytes()).context("gdb.send_inferior_input", "write PTY input")?;
         writer.flush().context("gdb.send_inferior_input", "flush PTY input")?;
         Ok(())
     }

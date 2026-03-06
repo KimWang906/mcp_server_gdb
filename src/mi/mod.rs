@@ -218,63 +218,36 @@ impl GDBBuilder {
 }
 
 impl GDB {
-#[cfg(unix)]
-#[allow(dead_code)]
-pub async fn interrupt_execution(&self) -> Result<(), nix::Error> {
-    use nix::sys::signal;
-    use nix::errno::Errno;
-    use nix::unistd::Pid;
-    let pid = self
-        .process
-        .lock()
-        .await
-        .id()
-        .ok_or_else(|| nix::Error::from(Errno::ESRCH))?;
-    signal::kill(Pid::from_raw(pid as i32), signal::SIGINT)
-}
-
-    pub async fn interrupt_execution_mi(&mut self) -> AppResult<()> {
-        let token = self.new_token();
-        let command = commands::MiCommand::exec_interrupt();
+    /// Interrupt the GDB inferior.
+    ///
+    /// Strategy (in order):
+    /// 1. **Unix**: send SIGINT to the GDB process — GDB forwards this to the
+    ///    remote stub as an RSP interrupt packet, which works reliably for both
+    ///    native and QEMU system targets.
+    /// 2. **Fallback / Windows**: write `0x03` (ctrl-c) to GDB's stdin. GDB
+    ///    treats an ASCII ETX on stdin as an interrupt request.
+    ///
+    /// A single `process` lock is held for the duration so SIGINT and the
+    /// optional stdin write never race each other.
+    pub async fn interrupt_execution(&mut self) -> AppResult<()> {
         let mut gdb = self.process.lock().await;
-        command
-            .write_interpreter_string(
-                gdb.stdin
-                    .as_mut()
-                    .ok_or_else(|| AppError::backend("mi.interrupt_execution_mi", "Failed to get stdin"))?,
-                token,
-            )
-            .await
-            .context("mi.interrupt_execution_mi", "write exec-interrupt command")?;
-        gdb.stdin
-            .as_mut()
-            .ok_or_else(|| {
-                AppError::backend(
-                    "mi.interrupt_execution_mi",
-                    "Failed to get stdin for exec-interrupt flush",
-                )
-            })?
-            .flush()
-            .await?;
-        Ok(())
-    }
 
-    pub async fn interrupt_execution_ctrl_c(&mut self) -> AppResult<()> {
-        let mut gdb = self.process.lock().await;
-        let stdin = gdb.stdin.as_mut().ok_or_else(|| {
-            AppError::backend(
-                "mi.interrupt_execution_ctrl_c",
-                "Failed to get stdin for ctrl-c interrupt",
-            )
-        })?;
-        stdin.write_all(b"\x03").await?;
-        stdin.flush().await?;
-        Ok(())
-    }
+        #[cfg(unix)]
+        {
+            use nix::sys::signal;
+            use nix::unistd::Pid;
+            if let Some(pid) = gdb.id() {
+                if signal::kill(Pid::from_raw(pid as i32), signal::SIGINT).is_ok() {
+                    return Ok(());
+                }
+            }
+        }
 
-    #[cfg(windows)]
-    #[allow(dead_code)]
-    pub async fn interrupt_execution(&self) -> Result<()> {
+        // Fallback (or Windows): ctrl-c via GDB stdin.
+        if let Some(stdin) = gdb.stdin.as_mut() {
+            stdin.write_all(b"\x03").await?;
+            stdin.flush().await?;
+        }
         Ok(())
     }
 
