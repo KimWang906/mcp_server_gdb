@@ -10,7 +10,7 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader as TokioBufReader;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -1305,27 +1305,27 @@ impl GDBManager {
         let interrupt_error = {
             #[cfg(feature = "qemu-system")]
             if backend == DebugBackendKind::QemuSystem {
-                let result = gdb.interrupt_execution_mi().await;
+                let result = gdb.interrupt_execution().await;
                 match result {
                     Ok(()) => {
                         debug!(
                             session_id = %session_id,
-                            "ensure_stopped: exec-interrupt sent for qemu-system"
+                            "ensure_stopped: SIGINT sent to GDB for qemu-system"
                         );
                         Ok(())
                     }
-                    Err(mi_err) => {
+                    Err(sigint_err) => {
                         warn!(
                             session_id = %session_id,
-                            error = %mi_err,
-                            "ensure_stopped: exec-interrupt failed, fallback ctrl-c"
+                            error = %sigint_err,
+                            "ensure_stopped: SIGINT failed, fallback ctrl-c"
                         );
                         gdb.interrupt_execution_ctrl_c().await.map_err(|ctrl_err| {
                             AppError::backend(
                                 "gdb.ensure_stopped",
                                 format!(
-                                    "interrupt failed: exec-interrupt={}; ctrl-c={}",
-                                    mi_err, ctrl_err
+                                    "interrupt failed: SIGINT={}; ctrl-c={}",
+                                    sigint_err, ctrl_err
                                 ),
                             )
                         })
@@ -1352,6 +1352,7 @@ impl GDBManager {
         }
 
         let status_update = async {
+            let mut last_status_log = Instant::now();
             loop {
                 let is_running = {
                     let gdb = gdb_handle.lock().await;
@@ -1363,6 +1364,16 @@ impl GDBManager {
                         handle.info.status = GDBSessionStatus::Stopped;
                     }
                     return Ok(());
+                }
+                let now = Instant::now();
+                if now.duration_since(last_status_log) >= Duration::from_secs(5) {
+                    info!(
+                        session_id = %session_id,
+                        backend = ?backend,
+                        is_running,
+                        "ensure_stopped polling"
+                    );
+                    last_status_log = now;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
@@ -1380,7 +1391,7 @@ impl GDBManager {
     /// Start debugging
     pub async fn start_debugging(&self, session_id: &str) -> AppResult<String> {
         // Determine the correct MI command based on how the session was created.
-        let launch_mode = {
+        let (launch_mode, backend) = {
             let sessions = self.sessions.lock().await;
             let handle = sessions.get(session_id).ok_or_else(|| {
                 AppError::not_found(
@@ -1388,7 +1399,7 @@ impl GDBManager {
                     format!("Session {} does not exist", session_id),
                 )
             })?;
-            handle.info.launch_mode.clone()
+            (handle.info.launch_mode.clone(), handle.info.backend.clone())
         };
 
         let cmd = match launch_mode {
@@ -1455,11 +1466,11 @@ impl GDBManager {
                 let sessions = self.sessions.lock().await;
                 sessions
                     .get(session_id)
-                    .ok_or_else(|| {
-                        AppError::not_found(
-                            "gdb.start_debugging",
-                            format!("Session {} does not exist", session_id),
-                        )
+                .ok_or_else(|| {
+                    AppError::not_found(
+                        "gdb.start_debugging",
+                        format!("Session {} does not exist", session_id),
+                    )
                     })?
                     .gdb
                     .clone()
@@ -1469,6 +1480,39 @@ impl GDBManager {
                 gdb.set_running(true);
             }
         }
+
+        let gdb = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(session_id)
+                .ok_or_else(|| {
+                    AppError::not_found(
+                        "gdb.start_debugging",
+                        format!("Session {} does not exist", session_id),
+                    )
+                })?
+                .gdb
+                .clone()
+        };
+        let is_running = {
+            let gdb = gdb.lock().await;
+            gdb.is_running()
+        };
+        if backend == DebugBackendKind::QemuSystem && !is_running {
+            warn!(
+                session_id = %session_id,
+                backend = ?backend,
+                launch_mode = ?launch_mode,
+                "start_debugging: qemu-system is_running remains false after start request"
+            );
+        }
+        debug!(
+            session_id = %session_id,
+            backend = ?backend,
+            launch_mode = ?launch_mode,
+            is_running,
+            "start_debugging complete"
+        );
 
         Ok(result_str)
     }

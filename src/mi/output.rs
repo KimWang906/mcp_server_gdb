@@ -13,7 +13,7 @@ use nom::sequence::{delimited, preceded, separated_pair};
 use nom::{IResult, Parser};
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultClass {
@@ -156,10 +156,16 @@ pub async fn process_output<T: AsyncRead + Unpin>(
                                 class: AsyncClass::Running, ..
                             } => {
                                 is_running.store(true, Ordering::SeqCst);
+                                debug!(
+                                    "process_output: received async *running for inferior state"
+                                );
                             }
                             OutOfBandRecord::AsyncRecord {
                                 class: AsyncClass::Stopped, ..
                             } => {
+                                warn!(
+                                    "process_output: received async *stopped for inferior state"
+                                );
                                 is_running.store(false, Ordering::SeqCst);
                             }
                             _ => {}
