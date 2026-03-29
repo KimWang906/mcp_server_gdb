@@ -42,16 +42,12 @@
           openssl.dev
         ];
 
-        # Tests spawn a real GDB process which is unavailable in the Nix
-        # build sandbox.  Integration tests are run via `nix develop` instead.
+        # Integration tests require a live GDB process which is not available
+        # inside the Nix build sandbox.
         doCheck = false;
 
         # Use system OpenSSL provided by buildInputs instead of vendored build.
         OPENSSL_NO_VENDOR = "1";
-
-        # Integration tests require a live GDB process which is not available
-        # inside the Nix build sandbox.
-        doCheck = false;
       };
     in {
       packages.default = mcp-server-gdb-pkg;
