@@ -42,8 +42,16 @@
           openssl.dev
         ];
 
+        # Tests spawn a real GDB process which is unavailable in the Nix
+        # build sandbox.  Integration tests are run via `nix develop` instead.
+        doCheck = false;
+
         # Use system OpenSSL provided by buildInputs instead of vendored build.
         OPENSSL_NO_VENDOR = "1";
+
+        # Integration tests require a live GDB process which is not available
+        # inside the Nix build sandbox.
+        doCheck = false;
       };
     in {
       packages.default = mcp-server-gdb-pkg;
@@ -87,5 +95,104 @@
           echo ""
         '';
       };
-    });
+    })
+    // {
+      # Nixpkgs overlay: exposes mcp-server-gdb as pkgs.mcp-server-gdb
+      overlays.default = final: _prev: {
+        mcp-server-gdb = self.packages.${final.system}.default;
+      };
+
+      # Home Manager module: declarative systemd user service
+      homeManagerModules.default = {
+        config,
+        lib,
+        pkgs,
+        ...
+      }: let
+        cfg = config.services.mcp-server-gdb;
+      in {
+        options.services.mcp-server-gdb = {
+          enable = lib.mkEnableOption "MCP GDB debug server (SSE transport)";
+
+          package = lib.mkOption {
+            type = lib.types.package;
+            default = self.packages.${pkgs.system}.default;
+            defaultText = lib.literalExpression "mcp-server-gdb";
+            description = "The mcp-server-gdb package to use.";
+          };
+
+          transport = lib.mkOption {
+            type = lib.types.enum ["stdio" "sse"];
+            default = "sse";
+            description = ''
+              Transport type.  Use "sse" for a persistent HTTP/SSE server
+              and "stdio" for subprocess-spawned MCP clients.
+            '';
+          };
+
+          ip = lib.mkOption {
+            type = lib.types.str;
+            default = "127.0.0.1";
+            description = "Bind address for the SSE HTTP server.";
+          };
+
+          port = lib.mkOption {
+            type = lib.types.port;
+            default = 7774;
+            description = "TCP port for the SSE HTTP server.";
+          };
+
+          logLevel = lib.mkOption {
+            type = lib.types.enum ["trace" "debug" "info" "warn" "error"];
+            default = "info";
+            description = "Log verbosity level.";
+          };
+
+          gdbTimeout = lib.mkOption {
+            type = lib.types.ints.positive;
+            default = 10;
+            description = "GDB command execution timeout in seconds.";
+          };
+
+          gefRcFile = lib.mkOption {
+            type = lib.types.nullOr lib.types.path;
+            default = null;
+            example = lib.literalExpression ''"''${config.home.homeDirectory}/.gef.rc"'';
+            description = "Optional path to a GEF rc file loaded at session start.";
+          };
+        };
+
+        config = lib.mkIf cfg.enable {
+          systemd.user.services.mcp-server-gdb = {
+            Unit = {
+              Description = "MCP GDB Debug Server";
+              After = ["network.target"];
+            };
+
+            Service = {
+              Type = "simple";
+              ExecStart = lib.concatStringsSep " " (
+                [
+                  "${cfg.package}/bin/mcp-server-gdb"
+                  "--transport"
+                  cfg.transport
+                  "--log-level"
+                  cfg.logLevel
+                ]
+                ++ lib.optionals (cfg.gefRcFile != null) ["--gef-rc" (toString cfg.gefRcFile)]
+              );
+              Environment = [
+                "SERVER_IP=${cfg.ip}"
+                "SERVER_PORT=${toString cfg.port}"
+                "GDB_COMMAND_TIMEOUT=${toString cfg.gdbTimeout}"
+              ];
+              Restart = "on-failure";
+              RestartSec = "5s";
+            };
+
+            Install.WantedBy = ["default.target"];
+          };
+        };
+      };
+    };
 }
