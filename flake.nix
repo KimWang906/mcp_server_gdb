@@ -167,10 +167,10 @@
 
             Service = {
               Type = "simple";
+              # transport is a positional argument (not --transport flag)
               ExecStart = lib.concatStringsSep " " (
                 [
                   "${cfg.package}/bin/mcp-server-gdb"
-                  "--transport"
                   cfg.transport
                   "--log-level"
                   cfg.logLevel
