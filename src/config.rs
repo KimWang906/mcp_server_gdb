@@ -23,9 +23,7 @@ impl Default for Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10),
-            gef_rc: std::env::var("GEF_RC")
-                .ok()
-                .map(std::path::PathBuf::from),
+            gef_rc: std::env::var("GEF_RC").ok().map(std::path::PathBuf::from),
         }
     }
 }

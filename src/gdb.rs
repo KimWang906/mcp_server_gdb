@@ -15,6 +15,20 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::{AppError, AppResult, ErrorKind, ResultContextExt};
+
+/// Locate the GEF Python script using a priority-ordered search:
+/// 1. `vendor/gef/gef.py` relative to the current working directory (development).
+/// 2. `<binary>/../share/gef/gef.py` relative to the running executable (installed via Nix/FHS).
+fn find_gef_script() -> Option<PathBuf> {
+    let cwd_path = PathBuf::from("vendor/gef/gef.py");
+    if cwd_path.exists() {
+        return Some(cwd_path);
+    }
+    std::env::current_exe().ok().and_then(|exe| {
+        let share_path = exe.parent()?.parent()?.join("share/gef/gef.py");
+        share_path.exists().then_some(share_path)
+    })
+}
 use crate::mi::commands::{BreakPointLocation, BreakPointNumber, MiCommand, RegisterFormat};
 use crate::mi::output::{OutOfBandRecord, ResultClass, ResultRecord, StreamKind};
 use crate::mi::{GDB, GDBBuilder};
@@ -156,10 +170,7 @@ impl GDBManager {
         let gef_rc = gef_rc.or_else(|| self.config.gef_rc.clone());
 
         if gef_script.is_none() {
-            let default_gef = PathBuf::from("vendor/gef/gef.py");
-            if default_gef.exists() {
-                gef_script = Some(default_gef);
-            }
+            gef_script = find_gef_script();
         }
 
         if create_pty {
@@ -611,10 +622,7 @@ impl GDBManager {
         let mut gef_script = gef_script;
         let gef_rc = gef_rc.or_else(|| self.config.gef_rc.clone());
         if gef_script.is_none() {
-            let default_gef = PathBuf::from("vendor/gef/gef.py");
-            if default_gef.exists() {
-                gef_script = Some(default_gef);
-            }
+            gef_script = find_gef_script();
         }
 
         // Default symbol file to the binary itself.
@@ -957,10 +965,7 @@ impl GDBManager {
         let mut gef_script = gef_script;
         let gef_rc = gef_rc.or_else(|| self.config.gef_rc.clone());
         if gef_script.is_none() {
-            let default_gef = PathBuf::from("vendor/gef/gef.py");
-            if default_gef.exists() {
-                gef_script = Some(default_gef);
-            }
+            gef_script = find_gef_script();
         }
 
         let gdb_builder = GDBBuilder {

@@ -46,6 +46,13 @@
         # inside the Nix build sandbox.
         doCheck = false;
 
+        # Install gef.py so the binary can locate it at
+        # $out/share/gef/gef.py regardless of the working directory.
+        postInstall = ''
+          mkdir -p $out/share/gef
+          cp vendor/gef/gef.py $out/share/gef/gef.py
+        '';
+
         # Use system OpenSSL provided by buildInputs instead of vendored build.
         OPENSSL_NO_VENDOR = "1";
       };
