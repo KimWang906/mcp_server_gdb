@@ -1,0 +1,52 @@
+From bf833765ad47ae1230f1c6c5ec24ea4ba4dd58e1 Mon Sep 17 00:00:00 2001
+From: KimWang906 <hyunbin06git@gmail.com>
+Date: Thu, 2 Apr 2026 23:23:38 +0900
+Subject: [PATCH] fix: check read permission before reusing cached temp files
+
+os.path.exists() alone does not verify that the current process can
+actually read the file. When /tmp/gef/ contains a file created by
+a different user (e.g. root), the reuse path would proceed and then
+fail with "Permission denied" inside gdb.execute("add-symbol-file ...").
+
+Add os.access(path, os.R_OK) to all three cache-reuse guards so that
+an unreadable cached file is silently regenerated instead of causing
+a hard error.
+
+---
+ gef.py | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/gef.py b/gef.py
+index c5a61f3e..fbf0f8b7 100644
+--- a/gef.py
++++ b/gef.py
+@@ -19637,7 +19637,7 @@ class SearchCfiGadgetsCommand(GenericCommand, BufferingOutput):
+             output_file = "cfi_{:s}.txt".format(os.path.basename(filepath))
+             output_path = os.path.join(GEF_TEMP_DIR, output_file)
+ 
+-        if os.path.exists(output_path) and not args.rescan:
++        if os.path.exists(output_path) and not args.rescan and os.access(output_path, os.R_OK):
+             # read previous output
+             info("A previously used file found, will be reused")
+             self.out = open(output_path).read().splitlines()
+@@ -121604,7 +121604,7 @@ class VmlinuxToElfApplyCommand(GenericCommand):
+         symboled_vmlinux_file = os.path.join(GEF_TEMP_DIR, "dump-memory-{:s}.elf".format(h))
+ 
+         # check if it can be reused
+-        if (not rescan) and os.path.exists(symboled_vmlinux_file) and os.path.getsize(symboled_vmlinux_file) > 0:
++        if (not rescan) and os.path.exists(symboled_vmlinux_file) and os.path.getsize(symboled_vmlinux_file) > 0 and os.access(symboled_vmlinux_file, os.R_OK):
+             info("A previously used file found, will be reused")
+             return symboled_vmlinux_file
+ 
+@@ -144333,7 +144333,7 @@ class KsymaddrRemoteApplyCommand(GenericCommand):
+         kversion = Kernel.kernel_version()
+         h = hashlib.sha256(String.str2bytes(kversion.version_string)).hexdigest()[-16:]
+         sym_elf_path = os.path.join(GEF_TEMP_DIR, "ks-apply-{:s}.elf".format(h))
+-        if (not args.rescan) and os.path.exists(sym_elf_path) and os.path.getsize(sym_elf_path) > 0:
++        if (not args.rescan) and os.path.exists(sym_elf_path) and os.path.getsize(sym_elf_path) > 0 and os.access(sym_elf_path, os.R_OK):
+             self.quiet_info("A previously used file found, will be reused")
+         else:
+             if os.path.exists(sym_elf_path):
+-- 
+2.53.0
+

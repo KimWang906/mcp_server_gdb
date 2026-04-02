@@ -46,6 +46,12 @@
         # inside the Nix build sandbox.
         doCheck = false;
 
+        # Apply local patches to vendored submodules before the build.
+        patches = [
+          ./patches/0001-gef-fix-read-permission-check-for-cached-temp-files.patch
+        ];
+        patchFlags = [ "-p1" "--directory=vendor/gef" ];
+
         # Install gef.py so the binary can locate it at
         # $out/share/gef/gef.py regardless of the working directory.
         postInstall = ''
@@ -102,6 +108,16 @@
             echo "Initialising vendor/gef submodule..."
             git submodule update --init vendor/gef
           fi
+
+          # Apply local patches to vendor/gef if not already applied.
+          for patch in patches/*.patch; do
+            if patch -d vendor/gef -p1 --dry-run --reverse --silent < "$patch" 2>/dev/null; then
+              echo "Already applied: $patch"
+            else
+              echo "Applying $patch..."
+              patch -d vendor/gef -p1 < "$patch"
+            fi
+          done
         '';
       };
     })
