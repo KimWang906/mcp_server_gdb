@@ -89,6 +89,12 @@
         shellHook = ''
           echo "Development environment activated"
           echo ""
+
+          # Ensure vendor/gef submodule is initialised for tests and local runs.
+          if [ ! -f vendor/gef/gef.py ]; then
+            echo "Initialising vendor/gef submodule..."
+            git submodule update --init vendor/gef
+          fi
         '';
       };
     })
