@@ -1,3 +1,4 @@
 [submodule "vendor/gef"]
 	path = vendor/gef
-	url = https://github.com/hugsy/gef.git
+	url = https://github.com/bata24/gef.git
+	branch = dev
