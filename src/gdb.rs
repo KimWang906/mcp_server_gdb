@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(any(feature = "qemu-user", feature = "qemu-system"))]
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -15,6 +17,38 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::{AppError, AppResult, ErrorKind, ResultContextExt};
+
+/// RAII guard that kills a QEMU child process on drop unless disarmed.
+///
+/// Prevents orphaned QEMU processes when session setup fails partway through.
+/// `start_kill()` is non-blocking, so this is safe to call from `Drop`.
+#[cfg(any(feature = "qemu-user", feature = "qemu-system"))]
+struct KillOnDrop(Option<tokio::process::Child>);
+
+#[cfg(any(feature = "qemu-user", feature = "qemu-system"))]
+impl KillOnDrop {
+    fn new(child: tokio::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn as_mut(&mut self) -> &mut tokio::process::Child {
+        self.0.as_mut().expect("KillOnDrop already disarmed")
+    }
+
+    /// Disarm the guard and return the child. The process will NOT be killed on drop.
+    fn disarm(mut self) -> tokio::process::Child {
+        self.0.take().expect("KillOnDrop already disarmed")
+    }
+}
+
+#[cfg(any(feature = "qemu-user", feature = "qemu-system"))]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.start_kill();
+        }
+    }
+}
 
 /// Locate the GEF Python script using a priority-ordered search:
 /// 1. `vendor/gef/gef.py` relative to the current working directory (development).
@@ -560,16 +594,19 @@ impl GDBManager {
 
         // ── 5. Spawn QEMU ─────────────────────────────────────────────────────
         let binary_args = binary_args.unwrap_or_default();
-        let mut raw_child =
+        let raw_child =
             spawn_qemu_user(&qemu_bin, port, &binary, &binary_args, resolved_sysroot.as_deref())
                 .await?;
 
+        // Guard kills QEMU if setup fails before the session is registered.
+        let mut guard = KillOnDrop::new(raw_child);
+
         // Take stdin pipe before moving `raw_child` into Arc<Mutex<>>.
-        let qemu_user_stdin = raw_child.stdin.take().map(|s| Arc::new(Mutex::new(s)));
+        let qemu_user_stdin = guard.as_mut().stdin.take().map(|s| Arc::new(Mutex::new(s)));
 
         // Drain QEMU stderr into a rolling buffer for diagnostics.
-        let stderr_lines = Arc::new(Mutex::new(Vec::<String>::new()));
-        if let Some(stderr) = raw_child.stderr.take() {
+        let stderr_lines = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        if let Some(stderr) = guard.as_mut().stderr.take() {
             let lines_clone = stderr_lines.clone();
             tokio::spawn(async move {
                 let mut reader = TokioBufReader::new(stderr);
@@ -581,9 +618,9 @@ impl GDBManager {
                         Ok(_) => {
                             let mut buf = lines_clone.lock().await;
                             if buf.len() >= 50 {
-                                buf.remove(0);
+                                buf.pop_front();
                             }
-                            buf.push(line.trim_end().to_string());
+                            buf.push_back(line.trim_end().to_string());
                         }
                     }
                 }
@@ -592,7 +629,7 @@ impl GDBManager {
 
         // Drain QEMU stdout (emulated binary output) into inferior_output buffer.
         let inferior_output_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let stdout_drain_handle = if let Some(stdout) = raw_child.stdout.take() {
+        let stdout_drain_handle = if let Some(stdout) = guard.as_mut().stdout.take() {
             let buf_clone = inferior_output_buf.clone();
             Some(tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
@@ -610,10 +647,10 @@ impl GDBManager {
         };
 
         // Wait for the GDB stub to open its port (timeout: 3 s).
-        wait_for_tcp_ready(&mut raw_child, port, Duration::from_secs(3)).await?;
+        wait_for_tcp_ready(guard.as_mut(), port, Duration::from_secs(3)).await?;
 
-        // Wrap in Arc so the monitor task and close_session can share ownership.
-        let child_arc = Arc::new(Mutex::new(raw_child));
+        // Disarm guard: setup succeeded up to this point, Arc takes ownership.
+        let child_arc = Arc::new(Mutex::new(guard.disarm()));
 
         let qemu_process =
             QemuProcess { child: child_arc.clone(), port, stderr_lines: stderr_lines.clone() };
@@ -855,6 +892,28 @@ impl GDBManager {
 
         let session_id = Uuid::new_v4().to_string();
 
+        // ── Validate gdb_port ─────────────────────────────────────────────────
+        if gdb_port == 0 {
+            return Err(AppError::invalid_argument(
+                "qemu.create_system_session",
+                "gdb_port must be a non-zero port number",
+            ));
+        }
+        let expected_gdb_arg = format!("tcp::{}", gdb_port);
+        let has_gdb_flag = qemu_args.windows(2).any(|w| {
+            w[0].to_string_lossy() == "-gdb" && w[1].to_string_lossy() == expected_gdb_arg
+        });
+        if !has_gdb_flag {
+            return Err(AppError::invalid_argument(
+                "qemu.create_system_session",
+                format!(
+                    "qemu_args must contain \"-gdb {}\" (matching gdb_port={}). \
+                     Also ensure \"-S\" is present to start the VM in halted state.",
+                    expected_gdb_arg, gdb_port
+                ),
+            ));
+        }
+
         // ── Serial socket injection ───────────────────────────────────────────
         // If the user hasn't already passed `-serial`, inject a Unix socket
         // chardev so we can capture VM console output in `inferior_output`.
@@ -893,11 +952,14 @@ impl GDBManager {
         }
 
         // ── Spawn QEMU system VM ──────────────────────────────────────────────
-        let mut raw_child = spawn_qemu_system(&qemu_path, &qemu_args, &extra_args).await?;
+        let raw_child = spawn_qemu_system(&qemu_path, &qemu_args, &extra_args).await?;
+
+        // Guard kills QEMU if setup fails before the session is registered.
+        let mut guard = KillOnDrop::new(raw_child);
 
         // Drain QEMU stderr.
-        let stderr_lines = Arc::new(Mutex::new(Vec::<String>::new()));
-        if let Some(stderr) = raw_child.stderr.take() {
+        let stderr_lines = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        if let Some(stderr) = guard.as_mut().stderr.take() {
             let lines_clone = stderr_lines.clone();
             tokio::spawn(async move {
                 let mut reader = TokioBufReader::new(stderr);
@@ -909,9 +971,9 @@ impl GDBManager {
                         Ok(_) => {
                             let mut buf = lines_clone.lock().await;
                             if buf.len() >= 50 {
-                                buf.remove(0);
+                                buf.pop_front();
                             }
-                            buf.push(line.trim_end().to_string());
+                            buf.push_back(line.trim_end().to_string());
                         }
                     }
                 }
@@ -919,7 +981,7 @@ impl GDBManager {
         }
 
         // System mode can take longer to start; allow 10 s.
-        wait_for_tcp_ready(&mut raw_child, gdb_port, Duration::from_secs(10)).await?;
+        wait_for_tcp_ready(guard.as_mut(), gdb_port, Duration::from_secs(10)).await?;
 
         // ── Serial socket drain ───────────────────────────────────────────────
         let inferior_output_buf: Option<Arc<Mutex<Vec<u8>>>>;
@@ -927,8 +989,10 @@ impl GDBManager {
         let serial_writer_half: Option<Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>>;
 
         if let Some(ref sock_path) = serial_sock_path {
+            // Allow up to 5 s: GDB port being ready does not guarantee the
+            // serial Unix socket is created yet (QEMU is still initialising).
             let stream =
-                connect_unix_serial(&mut raw_child, sock_path, Duration::from_secs(2)).await?;
+                connect_unix_serial(guard.as_mut(), sock_path, Duration::from_secs(5)).await?;
             let (read_half, write_half) = stream.into_split();
 
             let output_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -954,7 +1018,8 @@ impl GDBManager {
             serial_writer_half = None;
         }
 
-        let child_arc = Arc::new(Mutex::new(raw_child));
+        // Disarm guard: all fallible setup above succeeded.
+        let child_arc = Arc::new(Mutex::new(guard.disarm()));
         let qemu_process = QemuProcess {
             child: child_arc.clone(),
             port: gdb_port,

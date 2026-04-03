@@ -32,6 +32,9 @@
           lockFile = "${self}/Cargo.lock";
         };
 
+        # Enable QEMU user-mode and system-mode debugging support.
+        buildFeatures = [ "qemu-user" "qemu-system" ];
+
         nativeBuildInputs = with pkgs; [
           pkg-config
           perl
@@ -41,6 +44,12 @@
           openssl
           openssl.dev
         ];
+
+        # QEMU binaries are resolved from PATH at runtime; make them available
+        # in the service's PATH via wrapProgram or by adding them to the store
+        # path. Simplest approach: add qemu to buildInputs so it ends up in the
+        # closure, then expose it via the service environment.
+        propagatedBuildInputs = with pkgs; [ qemu ];
 
         # Integration tests require a live GDB process which is not available
         # inside the Nix build sandbox.

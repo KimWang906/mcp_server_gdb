@@ -3,6 +3,7 @@
 /// Provides user-mode and system-mode QEMU process management,
 /// ELF architecture detection, port allocation, and TCP readiness checks.
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Arc;
@@ -82,7 +83,7 @@ pub struct QemuProcess {
     /// GDB remote stub port QEMU is listening on.
     pub port: u16,
     /// Rolling buffer of the last 50 QEMU stderr lines (for diagnostics).
-    pub stderr_lines: Arc<Mutex<Vec<String>>>,
+    pub stderr_lines: Arc<Mutex<VecDeque<String>>>,
 }
 
 // ─── ELF info (qemu-user only) ───────────────────────────────────────────────
