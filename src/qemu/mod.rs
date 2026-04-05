@@ -351,7 +351,7 @@ pub async fn connect_unix_serial(
 #[cfg(any(feature = "qemu-user", feature = "qemu-system"))]
 pub fn spawn_qemu_monitor(
     child_arc: Arc<Mutex<tokio::process::Child>>,
-    stderr_lines: Arc<Mutex<Vec<String>>>,
+    stderr_lines: Arc<Mutex<VecDeque<String>>>,
     session_id: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
