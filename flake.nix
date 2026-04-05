@@ -38,18 +38,13 @@
         nativeBuildInputs = with pkgs; [
           pkg-config
           perl
+          makeWrapper
         ];
         buildInputs = with pkgs; [
           gdb
           openssl
           openssl.dev
         ];
-
-        # QEMU binaries are resolved from PATH at runtime; make them available
-        # in the service's PATH via wrapProgram or by adding them to the store
-        # path. Simplest approach: add qemu to buildInputs so it ends up in the
-        # closure, then expose it via the service environment.
-        propagatedBuildInputs = with pkgs; [ qemu ];
 
         # Integration tests require a live GDB process which is not available
         # inside the Nix build sandbox.
@@ -61,11 +56,14 @@
         ];
         patchFlags = [ "-p1" "--directory=vendor/gef" ];
 
-        # Install gef.py so the binary can locate it at
-        # $out/share/gef/gef.py regardless of the working directory.
+        # Install gef.py and wrap the binary so that gdb and all qemu-*
+        # binaries are always on PATH regardless of the calling environment.
         postInstall = ''
           mkdir -p $out/share/gef
           cp vendor/gef/gef.py $out/share/gef/gef.py
+
+          wrapProgram $out/bin/mcp-server-gdb \
+            --prefix PATH : ${pkgs.lib.makeBinPath (with pkgs; [ gdb qemu ])}
         '';
 
         # Use system OpenSSL provided by buildInputs instead of vendored build.
