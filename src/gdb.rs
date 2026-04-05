@@ -1040,7 +1040,15 @@ impl GDBManager {
             opt_quiet: true,
             opt_cd: None,
             opt_bps: None,
-            opt_symbol_file: symbol_file,
+            // Do NOT load the symbol file before `target remote`.  Loading it
+            // early causes GEF's new_objfile_handler to call set_arch() while
+            // GDB has no remote target connected, at which point `show
+            // architecture` reports the default i386 (32-bit) architecture and
+            // current_arch is permanently cached as X86(mode="32").
+            // The symbol file is loaded via an explicit `file` command after
+            // `target remote` succeeds, so that GEF sees the correct
+            // i386:x86-64 (or other) architecture from the connected target.
+            opt_symbol_file: None,
             opt_core_file: None,
             opt_proc_id: None,
             opt_command: None,
@@ -1209,6 +1217,25 @@ impl GDBManager {
                 "qemu.create_system_session",
                 "target remote failed after 5 attempts",
             ));
+        }
+
+        // Load the symbol file AFTER `target remote` so that GEF's
+        // new_objfile_handler fires while GDB already knows the remote
+        // target architecture (e.g. i386:x86-64).  If we loaded it before
+        // `target remote`, GEF would call set_arch() while GDB defaults to
+        // i386 (32-bit), permanently breaking pagewalk / vmmap.
+        if let Some(ref sf) = symbol_file {
+            let file_cmd = MiCommand::cli_exec(&format!(
+                "file {}",
+                sf.display()
+            ));
+            if let Err(e) = self.send_command(&session_id, &file_cmd).await {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to load symbol file after target remote; continuing anyway"
+                );
+            }
         }
 
         // Start monitor task.
