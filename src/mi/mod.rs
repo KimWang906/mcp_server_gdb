@@ -8,7 +8,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use anyhow::Result;
 use output::process_output;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};

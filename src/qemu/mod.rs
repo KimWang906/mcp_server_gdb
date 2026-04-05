@@ -366,7 +366,7 @@ pub fn spawn_qemu_monitor(
                 warn!(
                     session_id = %session_id,
                     exit_status = ?status,
-                    last_stderr = ?lines.last(),
+                    last_stderr = ?lines.back(),
                     "QEMU process exited"
                 );
                 break;

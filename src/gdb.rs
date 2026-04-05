@@ -798,7 +798,7 @@ impl GDBManager {
                     if let Some(ref qemu) = h.qemu {
                         let child_status = qemu.child.lock().await.try_wait().ok().flatten();
                         if let Some(status) = child_status {
-                            let last_line = qemu.stderr_lines.lock().await.last().cloned();
+                            let last_line = qemu.stderr_lines.lock().await.back().cloned();
                             Some((status, last_line))
                         } else {
                             None
@@ -1160,7 +1160,7 @@ impl GDBManager {
                     if let Some(ref qemu) = h.qemu {
                         let status = qemu.child.lock().await.try_wait().ok().flatten();
                         if let Some(status) = status {
-                            let last_err = qemu.stderr_lines.lock().await.last().cloned();
+                            let last_err = qemu.stderr_lines.lock().await.back().cloned();
                             Some((status, last_err))
                         } else {
                             None
