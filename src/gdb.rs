@@ -1620,7 +1620,12 @@ impl GDBManager {
         let command = MiCommand::delete_breakpoints(
             breakpoints
                 .iter()
-                .map(|num| serde_json::from_str::<BreakPointNumber>(num))
+                .map(|num| {
+                    // serde_json::from_str parses the string as a JSON value, so "1" becomes
+                    // an integer rather than a string, causing BreakPointNumber deserialization
+                    // to fail.  Wrap in a JSON string value explicitly to avoid this.
+                    serde_json::from_value::<BreakPointNumber>(serde_json::Value::String(num.clone()))
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .context("gdb.delete_breakpoint", "parse breakpoint numbers")?,
         );
